@@ -7,6 +7,7 @@
   "editor.quickSuggestions": { "strings": "on" },
   "eslint.validate": ["javascript", "typescript", "vue"],
   "typescript.tsdk": "node_modules/typescript/lib",
+<<<<<<< HEAD
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
   "[python]": {
