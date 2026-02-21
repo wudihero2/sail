@@ -36,6 +36,8 @@ macro_rules! parse {
             .parse($input)
             .into_result()
             .map_err(SqlError::parser)?;
+        println!("--------------parse!: tokens-----------------------");
+        println!("{tokens:#?}");
         let tokens = tokens
             .as_slice()
             .map((length..length).into(), map_parser_input);
@@ -64,7 +66,11 @@ pub fn parse_statements(s: &str) -> SqlResult<Vec<Statement>> {
 }
 
 pub fn parse_one_statement(s: &str) -> SqlResult<Statement> {
+    println!("--------------parse_one_statement: s-----------------------");
+    println!("{s:#?}");
     let mut plan = parse_statements(s)?;
+    println!("--------------parse_one_statement: plan-----------------------");
+    println!("{plan:#?}");
     match (plan.pop(), plan.is_empty()) {
         (Some(x), true) => Ok(x),
         _ => Err(SqlError::invalid("expected one statement")),

@@ -78,9 +78,13 @@ pub async fn resolve_and_execute_plan(
     } else {
         plan
     };
+    println!("------------resolve_and_execute_plan: plan--------------");
+    println!("{plan:#?}");
     info.push(StringifiedPlan::new(
         PlanType::FinalPhysicalPlan,
         displayable(plan.as_ref()).indent(true).to_string(),
     ));
+    println!("------------resolve_and_execute_plan: info--------------");
+    println!("{info:#?}");
     Ok((plan, info))
 }

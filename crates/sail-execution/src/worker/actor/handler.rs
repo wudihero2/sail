@@ -104,6 +104,7 @@ impl WorkerActor {
         definition: TaskDefinition,
         peers: Vec<WorkerLocation>,
     ) -> ActorAction {
+        println!(">>> [Worker {}] received task {:?}", self.options.worker_id, key);
         self.peer_tracker.track(ctx, peers);
         self.task_runner
             .run_task(ctx, key, definition, self.options.session.task_ctx());

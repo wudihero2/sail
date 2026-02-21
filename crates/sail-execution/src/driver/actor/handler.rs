@@ -534,6 +534,7 @@ impl DriverActor {
                 };
                 self.job_scheduler
                     .update_task(&entry.key, TaskState::Scheduled, None, None);
+                println!(">>> [Driver] assign task {:?} to {:?}", entry.key, assignment.assignment);
                 match assignment.assignment {
                     TaskAssignment::Driver => self
                         .task_runner

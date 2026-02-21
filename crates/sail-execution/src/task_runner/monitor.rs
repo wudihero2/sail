@@ -43,12 +43,14 @@ where
             stream,
             signal,
         } = self;
+        println!(">>> [Task {:?}] started", key);
         let event = Self::running(key.clone());
         let _ = handle.send(event).await;
         let event = tokio::select! {
             x = Self::execute(key.clone(), stream) => x,
             x = Self::cancel(key.clone(), signal) => x,
         };
+        println!(">>> [Task {:?}] finished", key);
         let _ = handle.send(event).await;
     }
 

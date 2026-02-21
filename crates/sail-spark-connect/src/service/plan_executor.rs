@@ -131,6 +131,7 @@ async fn handle_execute_plan(
         let span = Span::enter_with_parent("JobRunner::execute", &span);
         service.runner().execute(ctx, plan).in_span(span).await?
     };
+    // 透過 oneshot 拿到 stream
     let rx = match mode {
         ExecutePlanMode::Lazy => {
             let _guard = span.set_local_parent();
@@ -235,6 +236,8 @@ pub(crate) async fn handle_execute_sql_command(
         }
     };
     let plan: spec::Plan = relation.clone().try_into()?;
+    println!("------------handle_execute_sql_command: plan--------------");
+    println!("{plan:#?}");
     let relation = match plan {
         spec::Plan::Query(_) => relation,
         command @ spec::Plan::Command(_) => {

@@ -123,6 +123,8 @@ impl SparkConnectService for SparkConnectServer {
     ) -> Result<Response<Self::ExecutePlanStream>, Status> {
         let request = request.into_inner();
         debug!("{request:?}");
+        println!("------------------------------------------------------------");
+        println!("{request:#?}");
         let session_id = request.session_id;
         let user_id = request.user_context.map(|u| u.user_id).unwrap_or_default();
         let metadata = ExecutorMetadata {
