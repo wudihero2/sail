@@ -66,6 +66,7 @@ pub fn parse_statements(s: &str) -> SqlResult<Vec<Statement>> {
 
 pub fn parse_one_statement(s: &str) -> SqlResult<Statement> {
     let mut plan = parse_statements(s)?;
+
     match (plan.pop(), plan.is_empty()) {
         (Some(x), true) => Ok(x),
         _ => Err(SqlError::invalid("expected one statement")),
