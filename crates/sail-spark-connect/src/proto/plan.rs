@@ -101,6 +101,7 @@ impl TryFrom<Relation> for spec::CommandPlan {
     }
 }
 
+#[derive(Debug)]
 enum RelationNode {
     Query(spec::QueryNode),
     Command(spec::CommandNode),
@@ -1047,7 +1048,31 @@ impl TryFrom<RelType> for RelationNode {
             RelType::UnresolvedTableValuedFunction(_) => {
                 Err(SparkError::todo("unresolved table valued function"))
             }
-            RelType::LateralJoin(_) => Err(SparkError::todo("lateral join")),
+            RelType::LateralJoin(lateral_join) => {
+                use sc::join::{JoinType};
+
+                let sc::LateralJoin { left, right, join_condition, join_type } = *lateral_join;
+                let left = left.required("lateral join left")?;
+                let right = right.required("lateral join right")?;
+                let join_type = match JoinType::try_from(join_type)? {
+                    JoinType::Unspecified => return Err(SparkError::invalid("unspecified join type")),
+                    JoinType::Inner => spec::JoinType::Inner,
+                    JoinType::FullOuter => return Err(SparkError::todo("lateral full outer join")),
+                    JoinType::LeftOuter => return Err(SparkError::todo("lateral left outer join")),
+                    JoinType::RightOuter => return Err(SparkError::todo("lateral right outer join")),
+                    JoinType::LeftAnti => return Err(SparkError::todo("lateral left anti join")),
+                    JoinType::LeftSemi => return Err(SparkError::todo("lateral left semi join")),
+                    JoinType::Cross => spec::JoinType::Cross,
+                };
+                let join_condition = join_condition.map(|x| x.try_into()).transpose()?;
+
+                Ok(RelationNode::Query(spec::QueryNode::LateralJoin {
+                    left: Box::new((*left).try_into()?),
+                    right: Box::new((*right).try_into()?),
+                    join_condition,
+                    join_type
+                }))
+            },
             RelType::ChunkedCachedLocalRelation(_) => {
                 Err(SparkError::todo("chunked cached local relation"))
             }

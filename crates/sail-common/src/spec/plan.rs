@@ -271,6 +271,12 @@ pub enum QueryNode {
         column_aliases: Option<Vec<Identifier>>,
         outer: bool,
     },
+    LateralJoin {
+        left:Box<QueryPlan>,
+        right:Box<QueryPlan>,
+        join_condition: Option<Expr>,
+        join_type: JoinType,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

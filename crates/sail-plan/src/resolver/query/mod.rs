@@ -1,5 +1,6 @@
 use async_recursion::async_recursion;
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_functions::unicode::right;
 use sail_common::spec;
 
 use crate::error::{PlanError, PlanResult};
@@ -14,6 +15,7 @@ mod dedup;
 mod filter;
 mod join;
 mod lateral;
+mod lateral_join;
 mod limit;
 mod misc;
 mod na;
@@ -343,6 +345,21 @@ impl PlanResolver<'_> {
                 )
                 .await?
             }
+            QueryNode::LateralJoin {
+                left,
+                right,
+                join_condition,
+                join_type
+            } => {
+                self.resolve_query_lateral_join(
+                    *left,
+                    *right,
+                    join_condition,
+                    join_type,
+                    state
+                )
+                .await?
+            },
         };
         self.verify_query_plan(&plan, state)?;
         self.register_schema_with_plan_id(&plan, plan_id, state)?;

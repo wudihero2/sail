@@ -59,10 +59,19 @@ pub async fn resolve_and_execute_plan(
     let mut info = vec![];
     let resolver = PlanResolver::new(ctx, config);
     let NamedPlan { plan, fields } = resolver.resolve_named_plan(plan).await?;
+
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    fs::write(format!("/Users/stanhsu/projects/sail/t2_{ts}.txt"), format!("{plan:#?}")).unwrap();
+
     info.push(plan.to_stringified(PlanType::InitialLogicalPlan));
     let df = execute_logical_plan(ctx, plan).await?;
     let (session_state, plan) = df.into_parts();
     let plan = session_state.optimize(&plan)?;
+
+    fs::write(format!("/Users/stanhsu/projects/sail/t3_{ts}.txt"), format!("{plan:#?}")).unwrap();
+
     let plan = if is_streaming_plan(&plan)? {
         rewrite_streaming_plan(plan)?
     } else {
