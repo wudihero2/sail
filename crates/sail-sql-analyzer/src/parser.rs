@@ -65,6 +65,10 @@ pub fn parse_statements(s: &str) -> SqlResult<Vec<Statement>> {
 
 pub fn parse_one_statement(s: &str) -> SqlResult<Statement> {
     let mut plan = parse_statements(s)?;
+
+    use std::fs;
+    fs::write("/Users/stanhsu/projects/sail/parse_one_statement_plan.txt", format!("{plan:#?}"));
+
     match (plan.pop(), plan.is_empty()) {
         (Some(x), true) => Ok(x),
         _ => Err(SqlError::invalid("expected one statement")),

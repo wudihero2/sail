@@ -400,7 +400,15 @@ fn from_ast_table(
         if !joins.is_empty() {
             return Err(SqlError::unsupported("lateral table with join"));
         }
-        query_plan_with_lateral_table_factor(input, table, true)
+        match &table {
+            TableFactor::TableFunction { .. } => {
+                query_plan_with_lateral_table_factor(input, table, true)
+            },
+            TableFactor::Query { .. } => {
+                query_plan_with_lateral_subquery(input, table)
+            },
+            _ => Err(SqlError::invalid("expected function or subquery for lateral table factor"))
+        }
     } else {
         query_plan_with_table_factor(input, table, joins)
     }
@@ -978,4 +986,34 @@ fn query_plan_with_lateral_views(
                 outer: outer.is_some(),
             }))
         })
+}
+
+fn query_plan_with_lateral_subquery(
+    input: Option<spec::QueryPlan>,
+    table: TableFactor,
+) -> SqlResult<spec::QueryPlan> {
+    let TableFactor::Query {
+        left: _,
+        query,
+        right: _,
+        sample,
+        modifiers,
+        alias,
+    } = table
+    else {
+        return Err(SqlError::invalid("expected subquery for lateral join"));
+    };
+
+    let right = from_ast_query(query)?;
+    let right = query_plan_with_table_alias(right, alias)?;
+    let left = input.unwrap_or_else(|| {
+        spec::QueryPlan::new(spec::QueryNode::Empty { produce_one_row: true })
+    });
+
+    Ok(spec::QueryPlan::new(spec::QueryNode::LateralJoin {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_condition: None,
+        join_type: spec::JoinType::Inner,
+    }))
 }
