@@ -14,7 +14,9 @@ use sail_common::spec;
 use sail_common_datafusion::catalog::{
     CatalogTableBucketBy, CatalogTableSort, TableColumnStatus, TableKind,
 };
-use sail_common_datafusion::datasource::{BucketBy, SinkMode, SourceInfo, TableFormatRegistry};
+use sail_common_datafusion::datasource::{
+    find_option, BucketBy, SinkMode, SourceInfo, TableFormatRegistry,
+};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::logical_expr::ExprWithSource;
 use sail_common_datafusion::rename::logical_plan::rename_logical_plan;
@@ -39,10 +41,7 @@ pub(super) enum WriteMode {
 }
 
 pub(super) enum WriteTarget {
-    Path {
-        location: String,
-    },
-    Sink,
+    DataSource,
     ExistingTable {
         table: spec::ObjectName,
         column_match: WriteColumnMatch,
@@ -77,7 +76,7 @@ pub(super) struct WritePlanBuilder {
     bucket_by: Option<spec::SaveBucketBy>,
     sort_by: Vec<spec::SortOrder>,
     cluster_by: Vec<spec::ObjectName>,
-    options: Vec<(String, String)>,
+    options: Vec<Vec<(String, String)>>,
     table_properties: Vec<(String, String)>,
 }
 
@@ -141,7 +140,7 @@ impl WritePlanBuilder {
     }
 
     pub fn with_options(mut self, options: Vec<(String, String)>) -> Self {
-        self.options = options;
+        self.options.push(options);
         self
     }
 
@@ -184,12 +183,7 @@ impl PlanResolver<'_> {
             return Err(PlanError::todo("CLUSTER BY for write"));
         }
         let input_schema = input.schema().inner().clone();
-        let options_map = options
-            .clone()
-            .into_iter()
-            .collect::<std::collections::HashMap<_, _>>();
         let mut file_write_options = FileWriteOptions {
-            path: String::new(),
             // The mode will be set later so the value here is just a placeholder.
             mode: SinkMode::ErrorIfExists,
             format: format.unwrap_or_default(),
@@ -199,30 +193,14 @@ impl PlanResolver<'_> {
                 .await?,
             bucket_by: self.resolve_write_bucket_by(bucket_by.clone())?,
             table_properties: vec![],
-            options: vec![options],
+            options,
         };
         let mut preconditions = vec![];
         match target {
-            WriteTarget::Path { location } => {
+            WriteTarget::DataSource => {
                 if !table_properties.is_empty() {
                     return Err(PlanError::invalid(
-                        "table properties are not supported for writing to a path",
-                    ));
-                }
-                if file_write_options.format.is_empty() {
-                    file_write_options.format = self.config.default_table_file_format.clone();
-                }
-                file_write_options.path = location;
-                let schema_for_cond =
-                    matches!(mode, WriteMode::OverwriteIf { .. }).then_some(input_schema.as_ref());
-                file_write_options.mode = self
-                    .resolve_write_mode(mode, schema_for_cond, state)
-                    .await?;
-            }
-            WriteTarget::Sink => {
-                if !table_properties.is_empty() {
-                    return Err(PlanError::invalid(
-                        "table properties are not supported for writing to a sink",
+                        "table properties are not supported for writing to a data source",
                     ));
                 }
                 if file_write_options.format.is_empty() {
@@ -263,9 +241,12 @@ impl PlanResolver<'_> {
                 }
                 file_write_options.sort_by = info.sort_by.into_iter().map(|x| x.into()).collect();
                 file_write_options.bucket_by = info.bucket_by.map(|x| x.into());
-                file_write_options.path = info.location.ok_or_else(|| {
+                let location = info.location.ok_or_else(|| {
                     PlanError::invalid(format!("table does not have a location: {table:?}"))
                 })?;
+                file_write_options
+                    .options
+                    .push(vec![("path".to_string(), location)]);
                 file_write_options.format = info.format;
                 file_write_options.options.insert(0, info.options);
                 file_write_options.table_properties = info.properties;
@@ -295,13 +276,14 @@ impl PlanResolver<'_> {
                     }
                 }
                 if let Some(location) = info.as_ref().and_then(|x| x.location.as_ref()) {
-                    file_write_options.path = location.clone();
-                } else if let Some(location) = options_map.get("location") {
-                    file_write_options.path = location.to_string();
-                } else if let Some(path) = options_map.get("path") {
-                    file_write_options.path = path.to_string();
+                    file_write_options
+                        .options
+                        .push(vec![("path".to_string(), location.clone())]);
                 } else {
-                    file_write_options.path = self.resolve_default_table_location(&table).await?;
+                    let default_location = self.resolve_default_table_location(&table).await?;
+                    file_write_options
+                        .options
+                        .insert(0, vec![("path".to_string(), default_location)]);
                 };
                 if file_write_options
                     .partition_by
@@ -314,6 +296,15 @@ impl PlanResolver<'_> {
                     ));
                 }
                 file_write_options.table_properties = table_properties.clone();
+                let all_options: Vec<std::collections::HashMap<String, String>> =
+                    file_write_options
+                        .options
+                        .iter()
+                        .map(|set| set.iter().cloned().collect())
+                        .collect();
+                let table_location = find_option(&all_options, "path")
+                    .or_else(|| find_option(&all_options, "location"))
+                    .unwrap_or_default();
                 let (if_not_exists, replace) = match action {
                     WriteTableAction::Create => (false, false),
                     WriteTableAction::CreateIfNotExists => (true, false),
@@ -343,26 +334,30 @@ impl PlanResolver<'_> {
                     .collect();
                 let sort_by = self.resolve_catalog_table_sort(sort_by)?;
                 let bucket_by = self.resolve_catalog_table_bucket_by(bucket_by)?;
+                // TODO: Revisit passing write options to CreateTableOptions.
+                let create_table_options: Vec<(String, String)> = file_write_options
+                    .options
+                    .iter()
+                    .flatten()
+                    .filter(|(k, _)| {
+                        !k.eq_ignore_ascii_case("path") && !k.eq_ignore_ascii_case("location")
+                    })
+                    .cloned()
+                    .collect();
                 let command = CatalogCommand::CreateTable {
                     table: table.into(),
                     options: CreateTableOptions {
                         columns,
                         comment: None,
                         constraints: vec![],
-                        location: Some(file_write_options.path.clone()),
+                        location: Some(table_location),
                         format: file_write_options.format.clone(),
                         partition_by,
                         sort_by,
                         bucket_by,
                         if_not_exists,
                         replace,
-                        options: file_write_options
-                            .options
-                            .last()
-                            .cloned()
-                            .into_iter()
-                            .flatten()
-                            .collect(),
+                        options: create_table_options,
                         properties: table_properties,
                     },
                 };
