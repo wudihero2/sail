@@ -74,12 +74,19 @@ impl PlanResolver<'_> {
             properties,
         } = definition;
         let input = self.resolve_query_plan(*input, state).await?;
-        let input = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-            Arc::new(input),
-            TableReference::Bare {
-                table: String::from(view.clone()).into(),
-            },
-        )?);
+        let input = match &input {
+            LogicalPlan::SubqueryAlias(sa)
+                if sa.alias == TableReference::bare(String::from(view.clone())) =>
+            {
+                input // 已經有了，不重複包
+            }
+            _ => LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                Arc::new(input),
+                TableReference::Bare {
+                    table: String::from(view.clone()).into(),
+                },
+            )?),
+        };
 
         let (fields, columns) = match columns {
             Some(columns) => {
