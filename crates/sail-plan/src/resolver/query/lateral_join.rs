@@ -106,5 +106,5 @@ fn needs_subquery_wrapper(plan: &LogicalPlan) -> bool {
         return true;
     };
     // If the Projection's input contains any OuterRef, it needs Subquery wrapping.
-    proj.input.all_out_ref_exprs().iter().count() > 0
+    !proj.input.all_out_ref_exprs().is_empty()
 }

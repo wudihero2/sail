@@ -101,7 +101,7 @@ impl PlanResolver<'_> {
             if let Some(outer_schema) = state.get_outer_query_schema() {
                 for (qualifier, field) in outer_schema.iter() {
                     if let Some(expected) = qualifier_filter {
-                        if !qualifier.is_some_and(|q| expected == q) {
+                        if qualifier.is_none_or(|q| expected != q) {
                             continue;
                         }
                     }

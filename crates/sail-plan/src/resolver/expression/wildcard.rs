@@ -70,7 +70,7 @@ impl PlanResolver<'_> {
                 if in_input || in_outer {
                     return Ok(NamedExpr::new(
                         vec!["*".to_string()],
-                        #[allow(deprecated)]
+                        #[expect(deprecated)]
                         expr::Expr::Wildcard {
                             qualifier: q,
                             options: Default::default(),
