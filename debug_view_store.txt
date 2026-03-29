@@ -1,0 +1,281 @@
+Projection(
+    Projection {
+        expr: [
+            Alias(
+                Alias {
+                    expr: Column(
+                        Column {
+                            relation: Some(
+                                Bare {
+                                    table: "t2",
+                                },
+                            ),
+                            name: "#2",
+                        },
+                    ),
+                    relation: Some(
+                        Bare {
+                            table: "t2",
+                        },
+                    ),
+                    name: "c1",
+                    metadata: None,
+                },
+            ),
+            Alias(
+                Alias {
+                    expr: Column(
+                        Column {
+                            relation: Some(
+                                Bare {
+                                    table: "t2",
+                                },
+                            ),
+                            name: "#3",
+                        },
+                    ),
+                    relation: Some(
+                        Bare {
+                            table: "t2",
+                        },
+                    ),
+                    name: "c2",
+                    metadata: None,
+                },
+            ),
+        ],
+        input: SubqueryAlias(
+            SubqueryAlias {
+                input: Projection(
+                    Projection {
+                        expr: [
+                            Alias(
+                                Alias {
+                                    expr: Column(
+                                        Column {
+                                            relation: None,
+                                            name: "#0",
+                                        },
+                                    ),
+                                    relation: None,
+                                    name: "#2",
+                                    metadata: None,
+                                },
+                            ),
+                            Alias(
+                                Alias {
+                                    expr: Column(
+                                        Column {
+                                            relation: None,
+                                            name: "#1",
+                                        },
+                                    ),
+                                    relation: None,
+                                    name: "#3",
+                                    metadata: None,
+                                },
+                            ),
+                        ],
+                        input: Projection(
+                            Projection {
+                                expr: [
+                                    Alias(
+                                        Alias {
+                                            expr: Column(
+                                                Column {
+                                                    relation: None,
+                                                    name: "column1",
+                                                },
+                                            ),
+                                            relation: None,
+                                            name: "#0",
+                                            metadata: None,
+                                        },
+                                    ),
+                                    Alias(
+                                        Alias {
+                                            expr: Column(
+                                                Column {
+                                                    relation: None,
+                                                    name: "column2",
+                                                },
+                                            ),
+                                            relation: None,
+                                            name: "#1",
+                                            metadata: None,
+                                        },
+                                    ),
+                                ],
+                                input: Values(
+                                    Values {
+                                        schema: DFSchema {
+                                            inner: Schema {
+                                                fields: [
+                                                    Field {
+                                                        name: "column1",
+                                                        data_type: Int32,
+                                                        nullable: true,
+                                                    },
+                                                    Field {
+                                                        name: "column2",
+                                                        data_type: Int32,
+                                                        nullable: true,
+                                                    },
+                                                ],
+                                                metadata: {},
+                                            },
+                                            field_qualifiers: [
+                                                None,
+                                                None,
+                                            ],
+                                            functional_dependencies: FunctionalDependencies {
+                                                deps: [],
+                                            },
+                                        },
+                                        values: [
+                                            [
+                                                Literal(
+                                                    Int32(0),
+                                                    None,
+                                                ),
+                                                Literal(
+                                                    Int32(2),
+                                                    None,
+                                                ),
+                                            ],
+                                            [
+                                                Literal(
+                                                    Int32(0),
+                                                    None,
+                                                ),
+                                                Literal(
+                                                    Int32(3),
+                                                    None,
+                                                ),
+                                            ],
+                                        ],
+                                    },
+                                ),
+                                schema: DFSchema {
+                                    inner: Schema {
+                                        fields: [
+                                            Field {
+                                                name: "#0",
+                                                data_type: Int32,
+                                                nullable: true,
+                                            },
+                                            Field {
+                                                name: "#1",
+                                                data_type: Int32,
+                                                nullable: true,
+                                            },
+                                        ],
+                                        metadata: {},
+                                    },
+                                    field_qualifiers: [
+                                        None,
+                                        None,
+                                    ],
+                                    functional_dependencies: FunctionalDependencies {
+                                        deps: [],
+                                    },
+                                },
+                            },
+                        ),
+                        schema: DFSchema {
+                            inner: Schema {
+                                fields: [
+                                    Field {
+                                        name: "#2",
+                                        data_type: Int32,
+                                        nullable: true,
+                                    },
+                                    Field {
+                                        name: "#3",
+                                        data_type: Int32,
+                                        nullable: true,
+                                    },
+                                ],
+                                metadata: {},
+                            },
+                            field_qualifiers: [
+                                None,
+                                None,
+                            ],
+                            functional_dependencies: FunctionalDependencies {
+                                deps: [],
+                            },
+                        },
+                    },
+                ),
+                alias: Bare {
+                    table: "t2",
+                },
+                schema: DFSchema {
+                    inner: Schema {
+                        fields: [
+                            Field {
+                                name: "#2",
+                                data_type: Int32,
+                                nullable: true,
+                            },
+                            Field {
+                                name: "#3",
+                                data_type: Int32,
+                                nullable: true,
+                            },
+                        ],
+                        metadata: {},
+                    },
+                    field_qualifiers: [
+                        Some(
+                            Bare {
+                                table: "t2",
+                            },
+                        ),
+                        Some(
+                            Bare {
+                                table: "t2",
+                            },
+                        ),
+                    ],
+                    functional_dependencies: FunctionalDependencies {
+                        deps: [],
+                    },
+                },
+            },
+        ),
+        schema: DFSchema {
+            inner: Schema {
+                fields: [
+                    Field {
+                        name: "c1",
+                        data_type: Int32,
+                        nullable: true,
+                    },
+                    Field {
+                        name: "c2",
+                        data_type: Int32,
+                        nullable: true,
+                    },
+                ],
+                metadata: {},
+            },
+            field_qualifiers: [
+                Some(
+                    Bare {
+                        table: "t2",
+                    },
+                ),
+                Some(
+                    Bare {
+                        table: "t2",
+                    },
+                ),
+            ],
+            functional_dependencies: FunctionalDependencies {
+                deps: [],
+            },
+        },
+    },
+)

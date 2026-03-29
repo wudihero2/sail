@@ -1,0 +1,17 @@
+[
+    OuterReferenceColumn(
+        Field {
+            name: "#1",
+            data_type: Int32,
+            nullable: true,
+        },
+        Column {
+            relation: Some(
+                Bare {
+                    table: "t1",
+                },
+            ),
+            name: "#1",
+        },
+    ),
+]
