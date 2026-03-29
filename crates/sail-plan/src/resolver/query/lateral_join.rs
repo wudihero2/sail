@@ -158,7 +158,7 @@ fn collapse_projections(plan: LogicalPlan) -> datafusion_common::Result<LogicalP
                         let inner_map = build_output_name_map(&inner.expr);
                         let merged = inline_projection(&outer.expr, &inner_map);
 
-                        if is_identity_projection(&merged, &inner.input.schema()) {
+                        if is_identity_projection(&merged, inner.input.schema()) {
                             Ok(Transformed::yes(Arc::unwrap_or_clone(inner.input)))
                         } else {
                             Ok(Transformed::yes(LogicalPlan::Projection(
@@ -192,7 +192,7 @@ fn collapse_projections(plan: LogicalPlan) -> datafusion_common::Result<LogicalP
                             sa.alias,
                         )?);
 
-                        if is_identity_projection(&merged, &new_sa.schema()) {
+                        if is_identity_projection(&merged, new_sa.schema()) {
                             Ok(Transformed::yes(new_sa))
                         } else {
                             Ok(Transformed::yes(LogicalPlan::Projection(
