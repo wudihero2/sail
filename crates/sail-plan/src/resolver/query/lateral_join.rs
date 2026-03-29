@@ -248,9 +248,10 @@ fn inline_projection(outer_exprs: &[Expr], inner_map: &HashMap<String, Expr>) ->
                 metadata,
             }) => {
                 let resolved = match inner_expr.as_ref() {
-                    Expr::Column(col) => {
-                        inner_map.get(&col.name).cloned().unwrap_or(*inner_expr.clone())
-                    }
+                    Expr::Column(col) => inner_map
+                        .get(&col.name)
+                        .cloned()
+                        .unwrap_or(*inner_expr.clone()),
                     other => other.clone(),
                 };
                 Expr::Alias(Alias {
