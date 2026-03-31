@@ -36,21 +36,31 @@ impl OptimizerRule for DecorrelateLateralProjection {
             return Ok(Transformed::no(plan));
         }
 
-        let subquery_alias = match &*join.right {
-            LogicalPlan::SubqueryAlias(sa) => Some(sa.alias.clone()),
-            _ => None,
-        };
+        // Unwrap: Join.right -> (Subquery ->) (SubqueryAlias ->) Projection
+        let right_ref = join.right.as_ref();
 
-        let right_plan = match &*join.right {
-            LogicalPlan::SubqueryAlias(sa) => sa.input.as_ref(),
+        // Peel off optional Subquery wrapper
+        let after_subquery = match right_ref {
+            LogicalPlan::Subquery(sq) => sq.subquery.as_ref(),
             other => other,
         };
 
-        let LogicalPlan::Projection(proj) = right_plan else {
+        // Peel off optional SubqueryAlias
+        let (subquery_alias, after_alias) = match after_subquery {
+            LogicalPlan::SubqueryAlias(sa) => (Some(sa.alias.clone()), sa.input.as_ref()),
+            other => (None, other),
+        };
+
+        let LogicalPlan::Projection(proj) = after_alias else {
             return Ok(Transformed::no(plan));
         };
 
+        // Only handle the case where OuterRef appears in the Projection exprs
+        // but NOT in deeper nodes (that case is for DecorrelateLateralJoin).
         if !proj.expr.iter().any(contains_outer_ref) {
+            return Ok(Transformed::no(plan));
+        }
+        if !proj.input.all_out_ref_exprs().is_empty() {
             return Ok(Transformed::no(plan));
         }
 
@@ -64,7 +74,13 @@ impl OptimizerRule for DecorrelateLateralProjection {
         let join_filter = join.filter;
 
         let left: LogicalPlan = Arc::unwrap_or_clone(join.left);
-        let right_inner = match Arc::unwrap_or_clone(join.right) {
+
+        // Unwrap right: (Subquery ->) (SubqueryAlias ->) Projection
+        let right_unwrapped = match Arc::unwrap_or_clone(join.right) {
+            LogicalPlan::Subquery(sq) => Arc::unwrap_or_clone(sq.subquery),
+            other => other,
+        };
+        let right_inner = match right_unwrapped {
             LogicalPlan::SubqueryAlias(sa) => Arc::unwrap_or_clone(sa.input),
             other => other,
         };

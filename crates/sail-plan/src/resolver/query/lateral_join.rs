@@ -39,16 +39,14 @@ impl PlanResolver<'_> {
         //
         // Before wrapping, collapse redundant Projection layers introduced by the
         // opaque field ID rename mechanism.
-        let right = if !outer_ref_columns.is_empty() && needs_subquery_wrapper(&right) {
-            let simplified = collapse_projections(right)?;
-            LogicalPlan::Subquery(Subquery {
-                subquery: Arc::new(simplified),
-                outer_ref_columns,
-                spans: Spans::new(),
-            })
-        } else {
-            right
-        };
+        // let right = if !outer_ref_columns.is_empty() && needs_subquery_wrapper(&right) {
+        let simplified = collapse_projections(right)?;
+
+        let right = LogicalPlan::Subquery(Subquery {
+            subquery: Arc::new(simplified),
+            outer_ref_columns,
+            spans: Spans::new(),
+        });
 
         let df_join_type = match join_type {
             spec::JoinType::Inner | spec::JoinType::Cross => datafusion_common::JoinType::Inner,
@@ -111,22 +109,6 @@ impl PlanResolver<'_> {
 
         Ok(plan)
     }
-}
-
-/// Check if OuterRef only appears in the top-level Projection's expr
-/// (the pattern handled by DecorrelateLateralProjection).
-/// If OuterRef also appears deeper (e.g. in Filter), return true
-/// so it gets wrapped as Subquery for DecorrelateLateralJoin.
-fn needs_subquery_wrapper(plan: &LogicalPlan) -> bool {
-    let plan = match plan {
-        LogicalPlan::SubqueryAlias(sa) => sa.input.as_ref(),
-        other => other,
-    };
-    let LogicalPlan::Projection(proj) = plan else {
-        return true;
-    };
-    // If the Projection's input contains any OuterRef, it needs Subquery wrapping.
-    !proj.input.all_out_ref_exprs().is_empty()
 }
 
 fn is_rename_projection(proj: &Projection) -> bool {
