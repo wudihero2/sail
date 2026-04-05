@@ -389,6 +389,7 @@ impl PlanResolver<'_> {
                         &function_name,
                         input,
                         arguments,
+                        &[], // ReadUdtf kwargs come via named_arguments, not NamedArgument exprs
                         None,
                         None,
                         f.deterministic(),
