@@ -39,14 +39,16 @@ impl PlanResolver<'_> {
         //
         // Before wrapping, collapse redundant Projection layers introduced by the
         // opaque field ID rename mechanism.
-        // let right = if !outer_ref_columns.is_empty() && needs_subquery_wrapper(&right) {
-        let simplified = collapse_projections(right)?;
-
-        let right = LogicalPlan::Subquery(Subquery {
-            subquery: Arc::new(simplified),
-            outer_ref_columns,
-            spans: Spans::new(),
-        });
+        let right = if !outer_ref_columns.is_empty() {
+            let simplified = collapse_projections(right)?;
+            LogicalPlan::Subquery(Subquery {
+                subquery: Arc::new(simplified),
+                outer_ref_columns,
+                spans: Spans::new(),
+            })
+        } else {
+            right
+        };
 
         let df_join_type = match join_type {
             spec::JoinType::Inner | spec::JoinType::Cross => datafusion_common::JoinType::Inner,
@@ -62,7 +64,7 @@ impl PlanResolver<'_> {
         let join_schema = Arc::new(build_join_schema(
             left.schema(),
             right.schema(),
-            &datafusion_common::JoinType::Inner,
+            &df_join_type,
         )?);
 
         let condition = if let Some(cond) = join_condition {
