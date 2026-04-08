@@ -335,14 +335,22 @@ version = "58.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "302b2e036335f3f04d65dad3f74ff1f2aae6dc671d6aa04dc6b61193761e16fb"
 dependencies = [
+ "arrow-arith",
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
+ "arrow-data",
  "arrow-ipc",
+ "arrow-ord",
+ "arrow-row",
  "arrow-schema",
+ "arrow-select",
+ "arrow-string",
  "base64 0.22.1",
  "bytes",
  "futures",
+ "once_cell",
+ "paste",
  "prost",
  "prost-types",
  "tonic",
@@ -6719,6 +6727,7 @@ dependencies = [
  "rustls",
  "sail-common",
  "sail-execution",
+ "sail-flight",
  "sail-session",
  "sail-spark-connect",
  "sail-telemetry",
@@ -6895,6 +6904,34 @@ dependencies = [
  "tonic-types",
  "tower",
  "url",
+]
+
+[[package]]
+name = "sail-flight"
+version = "0.5.3"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "datafusion",
+ "env_logger",
+ "futures",
+ "log",
+ "prost",
+ "sail-catalog",
+ "sail-catalog-memory",
+ "sail-common",
+ "sail-common-datafusion",
+ "sail-plan",
+ "sail-server",
+ "sail-session",
+ "sail-sql-analyzer",
+ "sail-sql-parser",
+ "sail-telemetry",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tonic-health",
 ]
 
 [[package]]
@@ -7126,6 +7163,7 @@ dependencies = [
  "pyo3",
  "sail-cli",
  "sail-common",
+ "sail-flight",
  "sail-spark-connect",
  "sail-telemetry",
  "tokio",
