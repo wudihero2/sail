@@ -239,6 +239,618 @@ Sail 已經有 `DynamicObjectStoreRegistry`，可以在這裡注入 caching laye
 - range read 的 cache 粒度需要設計（按 block？按 column chunk？）
 - cluster mode 每個 worker 有獨立的 local cache，需要考慮 cache 一致性
 
+
+## Key / Value 設計：為什麼 Cache 不需要懂 Parquet
+
+一個常見的疑問是：S3 上是 Parquet，cache 要怎麼知道裡面有什麼？
+value 要存完整的 Parquet 還是切開？
+
+答案是：cache 完全不需要知道「這是 Parquet」。
+DataFusion 的 Parquet reader 已經在上層把讀取切好了，
+cache 只看到一連串的 byte range GET，只需要快取 raw bytes。
+
+🔸 Parquet 讀取流程
+
+假設 S3 上有一個 Parquet 檔案：
+
+```
+s3://bucket/orders.parquet (100 MB)
+
+Parquet 內部 layout:
++================================================================+
+| Row Group 0                                                     |
+|  Col: order_id  (offset: 0,     length: 5 MB)                 |
+|  Col: customer  (offset: 5MB,   length: 8 MB)                 |
+|  Col: amount    (offset: 13MB,  length: 3 MB)                 |
+|  Col: region    (offset: 16MB,  length: 2 MB)                 |
+|  Col: timestamp (offset: 18MB,  length: 4 MB)                 |
++----------------------------------------------------------------+
+| Row Group 1                                                     |
+|  Col: order_id  (offset: 22MB,  length: 5 MB)                 |
+|  ...                                                            |
++----------------------------------------------------------------+
+| ...                                                             |
++----------------------------------------------------------------+
+| Footer (offset: 99.9MB, length: 100 KB)  <-- schema + stats   |
++================================================================+
+```
+
+當你執行 `SELECT order_id, amount FROM orders WHERE region = 'US'` 時，
+DataFusion 的 Parquet reader 發出這些 ObjectStore 請求：
+
+```
+1. GET orders.parquet  range: 99.9MB-100MB   (讀 footer，拿到 schema + 統計)
+2. (看 footer 的 stats，發現 Row Group 0 可能有 region='US')
+3. GET orders.parquet  range: 16MB-18MB      (讀 region column chunk 做 filter)
+4. (掃描 region column，找到符合的 row index)
+5. GET orders.parquet  range: 0-5MB          (讀 order_id column chunk)
+6. GET orders.parquet  range: 13MB-16MB      (讀 amount column chunk)
+```
+
+DataFusion 從不讀 customer 和 timestamp 欄位。
+cache 層完全不需要知道 Parquet 結構，它只看到 byte range GET。
+
+🔸 推薦方案：固定大小 Part（跟 Alluxio / SlateDB 一致）
+
+把每個檔案切成固定大小的 part（例如 1 MB），以 (path, part_id) 為 key：
+
+```
+Key:   (path: "s3://bucket/orders.parquet", part_id: 0)
+Value: bytes[0 .. 1MB]          <-- raw bytes，不是 Parquet 結構
+
+Key:   (path: "s3://bucket/orders.parquet", part_id: 1)
+Value: bytes[1MB .. 2MB]
+
+Key:   (path: "s3://bucket/orders.parquet", part_id: 99)
+Value: bytes[99MB .. 100MB]     <-- 包含 footer
+```
+
+🔸 GET 流程
+
+```
+DataFusion 請求: GET orders.parquet range: 13MB-16MB (amount column)
+                          |
+                          v
+              CachingObjectStore
+                          |
+              切成 parts:
+              part_id=13 (13MB-14MB)  -> cache lookup
+              part_id=14 (14MB-15MB)  -> cache lookup
+              part_id=15 (15MB-16MB)  -> cache lookup
+                          |
+              +------+--------+-------+
+              |      |        |       |
+              v      v        v       |
+            HIT    HIT      MISS     |
+            (local)(local)    |       |
+                              v       |
+                    fetch from S3     |
+                    save to cache     |
+                              |       |
+              +------+--------+-------+
+              |
+              v
+          combine 3 parts -> return bytes[13MB-16MB]
+```
+
+🔸 為什麼不用 (path, column_name) 當 key
+
+```
+方案 X（不推薦）：Parquet-aware key
+
+Key:   (path, row_group=0, column="amount")
+Value: 解壓後的 column chunk
+
+問題：
+1. cache 層必須理解 Parquet 格式（也要理解 CSV, JSON, ORC, Delta...）
+2. ObjectStore trait 的介面是 get(path, byte_range)，沒有 column 概念
+3. 不同格式要寫不同的 cache 邏輯
+4. 解壓後的資料比 raw bytes 大很多，浪費 cache 空間
+```
+
+🔸 為什麼不存完整 Parquet 檔案
+
+```
+方案 Y（不推薦）：存完整檔案
+
+Key:   path
+Value: 完整 100MB parquet file
+
+問題：
+1. 只查 2 個欄位卻 cache 100MB，浪費
+2. 大檔案寫入 cache 慢
+3. 小查詢也要等整個檔案 cache 好
+4. cache 容量被少數大檔案佔滿
+```
+
+🔸 完整查詢流程（含 cache warm-up）
+
+```
+=== 第一次查詢 ===
+
+SELECT order_id, amount FROM orders WHERE region = 'US'
+    |
+    v
+DataFusion Parquet Reader
+    |
+    | (1) get_range(orders.parquet, 99.9MB-100MB)  -- footer
+    v
+CachingObjectStore
+    +---> Foyer: lookup part_id=99
+    |     MISS -> S3 GET -> save part_id=99 -> return footer bytes
+    v
+DataFusion reads footer, decides to read Row Group 0
+    |
+    | (2) get_range(orders.parquet, 16MB-18MB)  -- region column
+    v
+CachingObjectStore
+    +---> Foyer: lookup part_id=16  MISS -> S3 -> save -> return
+    +---> Foyer: lookup part_id=17  MISS -> S3 -> save -> return
+    v
+DataFusion filters region='US', finds matching rows
+    |
+    | (3) get_range(orders.parquet, 0-5MB)   -- order_id
+    | (4) get_range(orders.parquet, 13-16MB) -- amount
+    v
+CachingObjectStore
+    +---> part 0-4:   MISS -> S3 -> save
+    +---> part 13-15: MISS -> S3 -> save
+    v
+Return results to user
+(total: 12 parts cached, 12 S3 GETs)
+
+
+=== 第二次執行同一個查詢 ===
+
+    | (1) get_range footer     -> part_id=99   HIT (cache)
+    | (2) get_range region     -> part 16,17   HIT (cache)
+    | (3) get_range order_id   -> part 0-4     HIT (cache)
+    | (4) get_range amount     -> part 13-15   HIT (cache)
+    |
+    全部從 local cache 讀，零 S3 請求
+
+
+=== 第三次：不同查詢但重疊欄位 ===
+
+SELECT order_id, customer FROM orders WHERE region = 'US'
+    |
+    | footer     -> part_id=99   HIT (之前已 cache)
+    | region     -> part 16,17   HIT (之前已 cache)
+    | order_id   -> part 0-4     HIT (之前已 cache)
+    | customer   -> part 5-12    MISS -> S3 -> save (新欄位)
+    |
+    只有 customer 欄位需要讀 S3，其他全部 cache hit
+```
+
+🔸 建議的 Sail 實作
+
+```rust
+pub struct CachingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    cache: HybridCache<PartKey, Bytes>,  // Foyer hybrid (memory + disk)
+    part_size: usize,                     // 建議 1 MB
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct PartKey {
+    path: String,      // "s3://bucket/orders.parquet"
+    part_id: u64,      // offset / part_size
+}
+
+// Value 就是 raw bytes，不做任何解析
+// Foyer 負責 memory vs disk 的 tiering
+```
+
+為什麼 part_size 建議 1 MB：
+- Parquet column chunk 通常 1-10 MB，1 MB part 能精準對齊
+- Alluxio 預設也是 1 MB page
+- 太小（如 64 KB）會產生大量 key，增加 metadata 開銷
+- 太大（如 16 MB）會浪費空間（只需要 1 MB 卻 cache 16 MB）
+
+
+## 不需要改 DataFusion：注入點在哪
+
+完全不需要修改 DataFusion 的 Parquet reader 源碼。
+DataFusion 透過 `ObjectStore` trait 讀取檔案，
+Sail 只需要在注入 ObjectStore 的地方多包一層 CachingObjectStore。
+
+🔸 現有的 ObjectStore 包裝鏈
+
+Sail 已經有多層 ObjectStore 包裝（decorator pattern）：
+
+```
+// crates/sail-object-store/src/registry.rs (line 164)
+fn get_dynamic_object_store(url: &Url) -> Result<Arc<dyn ObjectStore>> {
+    let store = match scheme {
+        AmazonS3  => Arc::new(LazyObjectStore::new(|| get_s3_object_store(url))),
+        Azure     => Arc::new(LazyObjectStore::new(|| get_azure_object_store(url))),
+        GCS       => Arc::new(LazyObjectStore::new(|| get_gcs_object_store(url))),
+        ...
+    };
+    //                 vvvvvvvvvvvvvvvvvvvv  最外層包 LoggingObjectStore
+    Ok(Arc::new(LoggingObjectStore::new(store)))
+}
+```
+
+目前的包裝鏈：
+
+```
+DataFusion ParquetExec
+    |
+    | calls ObjectStore::get_opts(path, range)
+    v
+LoggingObjectStore          <-- 記 log + tracing span
+    |
+    v
+RuntimeAwareObjectStore     <-- 切換到 IO runtime（選配）
+    |
+    v
+LazyObjectStore             <-- 延遲初始化（第一次用才建連線）
+    |
+    v
+S3 / Azure / GCS client    <-- 真正的 HTTP 請求
+```
+
+🔸 CachingObjectStore 要插在哪
+
+插在 LoggingObjectStore 和 inner store 之間：
+
+```
+DataFusion ParquetExec
+    |
+    | calls ObjectStore::get_opts(path, range)
+    v
+LoggingObjectStore              <-- 記 log（含 cache hit/miss 都會記到）
+    |
+    v
+CachingObjectStore              <-- 新增：查 Foyer cache
+    |                                hit -> 直接回傳 local bytes
+    |                                miss -> 往下走
+    v
+RuntimeAwareObjectStore
+    |
+    v
+LazyObjectStore
+    |
+    v
+S3 / Azure / GCS client
+```
+
+🔸 需要改的檔案
+
+只需要改 2 個檔案 + 新增 1 個檔案：
+
+```
+crates/sail-object-store/
+├── src/
+│   ├── layers/
+│   │   ├── mod.rs              <-- (改) 加 pub mod caching;
+│   │   ├── caching.rs          <-- (新增) CachingObjectStore 實作
+│   │   ├── logging.rs          <-- 不動
+│   │   ├── lazy.rs             <-- 不動
+│   │   └── runtime.rs          <-- 不動
+│   ├── registry.rs             <-- (改) 包一層 CachingObjectStore
+│   └── lib.rs                  <-- 不動
+└── Cargo.toml                  <-- (改) 加 foyer dependency
+```
+
+🔸 registry.rs 只改一行
+
+```rust
+// crates/sail-object-store/src/registry.rs
+// 改動前 (line 164):
+Ok(Arc::new(LoggingObjectStore::new(store)))
+
+// 改動後:
+let store = if cache_enabled {
+    Arc::new(CachingObjectStore::new(store, foyer_cache.clone()))
+} else {
+    store
+};
+Ok(Arc::new(LoggingObjectStore::new(store)))
+```
+
+🔸 caching.rs 的核心結構
+
+參考現有的 `LoggingObjectStore` 的 decorator pattern（同一個 layers 目錄）：
+
+```rust
+// crates/sail-object-store/src/layers/caching.rs
+use foyer::HybridCache;
+
+pub struct CachingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    cache: HybridCache<PartKey, Bytes>,
+    part_size: usize,  // 1 MB
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CachingObjectStore {
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        // 1. 把 range 切成 parts
+        // 2. 每個 part 查 cache
+        // 3. miss 的 part -> self.inner.get_opts() 讀 S3
+        // 4. 回填 cache
+        // 5. 組合回傳
+    }
+
+    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions)
+        -> Result<PutResult>
+    {
+        // 直接 delegate 到 inner，不 cache PUT
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn delete(&self, location: &Path) -> Result<()> {
+        // delegate + invalidate cache
+        self.cache.remove(&location_to_prefix(location));
+        self.inner.delete(location).await
+    }
+
+    // list, copy, rename -> 直接 delegate
+}
+```
+
+🔸 DataFusion 完全不知道 cache 的存在
+
+```
+DataFusion 視角（完全沒變）：
+
+let store = runtime_env.object_store("s3://bucket/")?;  // 拿到 ObjectStore
+let data = store.get_range(&path, 13MB..16MB).await?;    // 讀 bytes
+
+DataFusion 不知道這個 store 是：
+  LoggingObjectStore(
+    CachingObjectStore(          <-- 新加的，DataFusion 看不到
+      RuntimeAwareObjectStore(
+        LazyObjectStore(
+          S3 client
+        )
+      )
+    )
+  )
+
+就像 LoggingObjectStore 記 log 不影響 DataFusion，
+CachingObjectStore 做 cache 也不影響 DataFusion。
+這就是 ObjectStore trait 的 decorator pattern 的優勢。
+```
+
+🔸 完整調用鏈
+
+```
+PySpark: spark.sql("SELECT order_id, amount FROM orders WHERE region = 'US'")
+    |
+    v
+sail-spark-connect (gRPC)
+    |
+    v
+sail-plan (logical plan -> physical plan)
+    |
+    v
+DataFusion ParquetExec
+    |
+    | (1) store.get_range(orders.parquet, 99.9MB-100MB)  // footer
+    v
+ObjectStoreRegistry::get_store("s3://bucket/")
+    |
+    v
+LoggingObjectStore::get_opts()      // log: "get orders.parquet 99.9MB-100MB"
+    |
+    v
+CachingObjectStore::get_opts()      // part_id=99 -> Foyer lookup
+    |                                   HIT  -> return cached bytes
+    |                                   MISS -> 往下走
+    v
+RuntimeAwareObjectStore::get_opts() // 切到 IO runtime
+    |
+    v
+LazyObjectStore::get_opts()         // 第一次用才初始化 S3 client
+    |
+    v
+S3 client::get_range()              // HTTP GET with Range header
+    |
+    v
+CachingObjectStore                  // 回填：save part_id=99 to Foyer
+    |
+    v
+LoggingObjectStore                  // log: "get complete, 100KB, 45ms"
+    |
+    v
+DataFusion ParquetExec              // 拿到 footer bytes，解析 schema + stats
+    |
+    | (2) store.get_range(orders.parquet, 16MB-18MB)  // region column
+    | (3) store.get_range(orders.parquet, 0-5MB)      // order_id column
+    | (4) store.get_range(orders.parquet, 13MB-16MB)  // amount column
+    v
+... 同樣的流程，每個 range 獨立走 cache ...
+    |
+    v
+Return RecordBatch to user
+```
+
+
+## 分散式 Cache 一致性 與 有效性判斷
+
+Sail 是分散式引擎，Driver + 多個 Worker 各自有獨立的 RuntimeEnv。
+每個 Worker 建立自己的 `WorkerSessionFactory` → `RuntimeEnvFactory` → `ObjectStoreRegistry`，
+所以每個 Worker 會有自己獨立的 CachingObjectStore + Foyer cache。
+
+```
++------------------+     +------------------+     +------------------+
+| Worker 0         |     | Worker 1         |     | Worker 2         |
+| +--------------+ |     | +--------------+ |     | +--------------+ |
+| | Foyer Cache  | |     | | Foyer Cache  | |     | | Foyer Cache  | |
+| | (local NVMe) | |     | | (local NVMe) | |     | | (local NVMe) | |
+| +--------------+ |     | +--------------+ |     | +--------------+ |
++--------+---------+     +--------+---------+     +--------+---------+
+         |                        |                        |
+         v                        v                        v
++---------------------------------------------------------------+
+|                        S3 / GCS / ADLS                        |
++---------------------------------------------------------------+
+```
+
+問題一：Worker 之間的 cache 不共享，會不會有一致性問題？
+問題二：怎麼知道 cache 裡的資料還是有效的？
+
+🔸 為什麼 Data Lake 場景不需要跨 Worker 一致性
+
+Data Lake 的檔案（Parquet）是 write-once、immutable 的：
+
+```
+寫入:  s3://bucket/orders/part-00001.parquet  (一次寫入，永不修改)
+       s3://bucket/orders/part-00002.parquet
+       s3://bucket/orders/part-00003.parquet
+
+刪除:  透過 Delta Lake / Iceberg metadata 標記為「不再使用」
+       實際檔案可能還在 S3 上，但不會被新查詢讀到
+```
+
+因為檔案是 immutable 的：
+- 同一個 path + 同一個 byte range 永遠回傳同樣的 bytes
+- Worker 0 cache 了 part-00001.parquet 的 part_id=5
+- Worker 1 也 cache 了 part-00001.parquet 的 part_id=5
+- 兩者的內容保證一模一樣，不需要同步
+
+這就是為什麼 Trino + Alluxio 的嵌入式模式（每個 worker 獨立 cache）
+在生產環境中完全沒問題。
+
+🔸 Delta Lake / Iceberg 怎麼避免讀到過期資料
+
+```
+                   Transaction Log (Delta) / Manifest (Iceberg)
+                              |
+                              v
+                   "目前有效的檔案清單"
+                   - part-00001.parquet  (active)
+                   - part-00002.parquet  (active)
+                   - part-00003.parquet  (removed by compaction)
+                              |
+                              v
+                   DataFusion 只會讀 part-00001 和 part-00002
+                   part-00003 的 cache 自然不會被訪問
+                   最終被 LRU 驅逐
+```
+
+流程：
+1. 查詢開始時，Driver 讀 Delta/Iceberg metadata，得到「目前有效的檔案清單」
+2. 只有清單上的檔案會被分配給 Worker 執行
+3. 被 compaction 刪除的舊檔案不會出現在清單中
+4. 這些舊檔案的 cache 不會被讀取，最終被 Foyer 的 LRU 自動驅逐
+
+結論：不需要主動 invalidate，metadata 層已經保證了正確性。
+
+🔸 非 Data Lake 場景（raw Parquet on S3）
+
+如果使用者直接覆蓋 S3 上的 Parquet 檔案（而不是用 Delta/Iceberg），
+就會有 cache 過期的風險：
+
+```
+時間線：
+T1: Worker 讀 s3://bucket/data.parquet -> cache 填入
+T2: 外部程式覆蓋 s3://bucket/data.parquet (新資料)
+T3: Worker 再讀 -> cache HIT -> 拿到舊資料 (錯誤!)
+```
+
+解法有三種，可以依需求組合：
+
+```
++---------------------+-------------------------------------+----------+
+| 策略                | 做法                                | 成本     |
++---------------------+-------------------------------------+----------+
+| TTL (最簡單)        | 每個 cache entry 設定存活時間        | 零       |
+|                     | 過期後下次讀取重新從 S3 拉           |          |
+|                     | Foyer 原生支援 TTL                  |          |
++---------------------+-------------------------------------+----------+
+| ETag 驗證           | cache entry 存 S3 ETag              | 每次讀   |
+|                     | 讀取時先 HEAD 比對 ETag              | 多一個   |
+|                     | 不一致就 invalidate                  | HEAD     |
++---------------------+-------------------------------------+----------+
+| Last-Modified 比對  | 類似 ETag，用檔案修改時間判斷         | 同上     |
++---------------------+-------------------------------------+----------+
+```
+
+🔸 建議的 Sail 實作策略
+
+```rust
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct PartKey {
+    path: String,
+    part_id: u64,
+}
+
+struct PartValue {
+    data: Bytes,
+    etag: Option<String>,        // S3 回傳的 ETag
+    last_modified: Option<i64>,  // S3 回傳的 Last-Modified
+}
+```
+
+三級防護：
+
+```
+Level 1: Immutable File（Delta / Iceberg）
+   -> 檔案永遠不變，cache 永遠有效
+   -> 不需要任何額外處理
+
+Level 2: TTL（所有場景）
+   -> Foyer 設定 TTL（例如 1 小時）
+   -> 過期自動重新讀取
+   -> 保底機制，防止極端情況
+
+Level 3: ETag 驗證（選配，raw S3 場景）
+   -> GET 前先 HEAD 檢查 ETag
+   -> 如果跟 cache 裡的一致，直接用 cache
+   -> 不一致就 invalidate 重讀
+   -> 多一個 HEAD 但比完整 GET 便宜很多
+```
+
+實際查詢流程（帶 ETag 驗證）：
+
+```
+CachingObjectStore::get_opts(path, range)
+    |
+    v
+查 Foyer cache for (path, part_id)
+    |
+    +--> MISS -> fetch from S3 -> save (data + etag) to cache -> return
+    |
+    +--> HIT -> 檢查 TTL
+              |
+              +--> TTL 過期 -> HEAD request to S3
+              |                |
+              |                +--> ETag 一致 -> 更新 TTL -> return cached data
+              |                |
+              |                +--> ETag 不一致 -> invalidate -> re-fetch from S3
+              |
+              +--> TTL 未過期 -> return cached data (零 S3 請求)
+```
+
+🔸 為什麼不需要跨 Worker cache 同步
+
+```
++--------------------------------------------------------------------+
+| 方案                     | 複雜度 | 效益                           |
++--------------------------------------------------------------------+
+| 每個 Worker 獨立 cache   | 低     | 簡單、無單點故障、已被          |
+| (推薦)                   |        | Trino+Alluxio 驗證             |
++--------------------------------------------------------------------+
+| 共享 cache server        | 高     | cache 利用率更高，但多了       |
+| (如 Redis / LiquidCache) |        | 一個 network hop + 維運成本    |
++--------------------------------------------------------------------+
+| P2P cache                | 極高   | 理論最優，但實作極複雜          |
+| (Worker 互相借 cache)    |        | Alluxio standalone 就是這種    |
++--------------------------------------------------------------------+
+```
+
+對 Sail 來說，獨立 cache 是最佳選擇：
+- Data Lake 檔案 immutable，不需要同步
+- 每個 Worker 的 local NVMe 延遲 < 0.1ms，比 network cache 快 100 倍
+- Trino + Alluxio embedded 已經在生產環境驗證了這個模式
+- 如果同一個檔案被多個 Worker 讀，各自 cache 一份，空間浪費可接受
+  （NVMe SSD 容量大且便宜，比 S3 GET 成本低很多）
+
+
 🔸 方案 B：物理執行計畫包裝（類似 LiquidCache）
 
 新增一個 `CachedScanExec` 物理計畫節點，包裝原本的 scan operator。
@@ -443,3 +1055,383 @@ pub struct BroadcastExec {
 
 第一個 partition 執行 input 並存到 queue，其他 partition 直接讀。
 這是 broadcast join 的標準做法，Sail 可以參考做類似的 broadcast cache。
+
+
+## Trino + Alluxio：Parquet 快取架構
+
+Trino 透過 Alluxio 在 compute 和 remote storage 之間加了一層快取。
+有兩種部署模式：
+
+🔸 部署模式一覽
+
+```
+模式 A：獨立 Alluxio 叢集（經典）
+
+  Trino Worker  -->  Alluxio Worker  -->  Alluxio Master  -->  S3
+  Trino Worker  -->  Alluxio Worker  ------^
+  (alluxio:// scheme)
+
+模式 B：嵌入式 Local Cache（推薦，2024-2025 主流）
+
+  Trino Worker [ Alluxio Local Cache Library (embedded) ]
+       |                   |
+       |              Local NVMe SSD
+       |
+       +----> S3 (only on cache miss)
+```
+
+模式 B 更簡單，不需要維運另一個分散式系統。
+每個 Trino worker JVM 內嵌 Alluxio client library，
+用本地 NVMe SSD 當 cache storage。
+
+🔸 快取粒度
+
+Alluxio 在 byte-range / page 層級做快取，不理解 Parquet 格式：
+
+```
++----------------------------------------------------------+
+| Parquet File on S3                                       |
++----------+----------+----------+----------+--------------+
+| Col A    | Col B    | Col C    | Col D    | Footer       |
+| Chunk 0  | Chunk 0  | Chunk 0  | Chunk 0  | (schema,    |
+| 2 MB     | 3 MB     | 1 MB     | 4 MB     |  stats)     |
++----------+----------+----------+----------+--------------+
+     |          |                                  |
+     v          v                                  v
++---------+---------+----  ...  ----+---------+---------+
+| Page 0  | Page 1  | Page 2  ...   | Page 9  | Page 10 |
+| 1 MB    | 1 MB    | 1 MB         | 1 MB    | 1 MB    |
++---------+---------+----  ...  ----+---------+---------+
+  ^  cached            not cached      ^  cached
+```
+
+page size 預設 1 MB（可設定）。
+Trino 的 Parquet reader 做 column pruning，只讀需要的欄位。
+Alluxio 只快取被讀取的 byte range 對應的 page，
+所以未被查詢的欄位自然不會進 cache。
+
+🔸 Cache Invalidation
+
+```
++-------------------+-----------------------------------------------+
+| 機制              | 說明                                          |
++-------------------+-----------------------------------------------+
+| TTL 過期          | 每個 page 有 TTL（預設 7d），過期後重新讀 S3   |
+| 容量驅逐          | cache 滿了用 LRU 驅逐最冷的 page              |
+| 無主動通知        | S3 沒有 push notification，靠 TTL 被動失效    |
+| Data Lake 友好    | Parquet 是 write-once，Delta/Iceberg 用       |
+|                   | metadata 決定讀哪些檔案，舊檔案的 cache 自然  |
+|                   | 不會被用到                                    |
++-------------------+-----------------------------------------------+
+```
+
+🔸 Trino 嵌入式 Cache 設定
+
+```properties
+hive.cache.enabled=true
+hive.cache.location=/mnt/nvme0/cache,/mnt/nvme1/cache
+hive.cache.disk-usage-percentage=80
+hive.cache.ttl=7d
+hive.cache.page-size=1MB
+```
+
+🔸 獨立 Alluxio 叢集 vs 嵌入式
+
+```
++----------------------+-----------------------------+-------------------+
+| 面向                 | 獨立 Alluxio 叢集           | 嵌入式 Local Cache|
++----------------------+-----------------------------+-------------------+
+| 部署複雜度           | 高（Master + Workers）       | 低（只改 config）  |
+| Worker 間共享 cache  | 可以（Worker A 讀 B 的 cache）| 不行               |
+| Metadata 管理        | Alluxio Master 追蹤          | 各 worker 獨立     |
+| 故障影響             | Alluxio 掛了影響 Trino       | miss 直接走 S3     |
+| 適用場景             | 多引擎共享、超大規模          | 單 Trino 叢集      |
++----------------------+-----------------------------+-------------------+
+```
+
+🔸 跟 Sail #1015 的關係
+
+Trino + Alluxio 的嵌入式模式非常接近 Sail #1015 要做的事：
+在 ObjectStore 層包一個 local cache，format-agnostic，page-based。
+差別是 Alluxio 用 Java，Sail 打算用 Foyer（Rust）。
+
+Alluxio 的 page-based 設計（固定 1MB page）是一個值得參考的決策：
+- 簡單：不需要理解 Parquet 格式
+- 高效：Parquet 的 columnar layout 讓 column pruning 自然只 cache 需要的 page
+- 通用：CSV、JSON、ORC 都適用
+
+
+## RisingWave：Foyer 在串流引擎的應用
+
+RisingWave 是基於 S3 的即時串流處理平台。
+它的儲存引擎 Hummock 是分散式 LSM-Tree，
+用 Foyer 做 SSTable block 的 hybrid cache。
+
+🔸 三層儲存架構
+
+```
++------------------+
+|    Memory Cache  |  <-- Foyer memory layer
+|    (hottest data)|      eviction: LRU/LFU/w-TinyLFU/S3-FIFO/SIEVE
++--------+---------+
+         | miss / evict
+         v
++------------------+
+|    Disk Cache    |  <-- Foyer disk layer (NVMe SSD)
+|    (warm data)   |      engines: block / set-associative / object
+|    10-1000x      |      I/O: sync or io_uring
+|    larger than   |
+|    memory        |
++--------+---------+
+         | miss
+         v
++------------------+
+|    S3            |  <-- Durable storage
+|    (cold data)   |      only accessed on cache miss
++------------------+
+```
+
+🔸 快取什麼
+
+RisingWave 快取的最小單位是 SSTable 的 block（不是整個 SSTable）：
+
+```
++---------------------------------------------+
+| SSTable (on S3)                              |
++-------+-------+-------+-------+-------------+
+| Block | Block | Block | Block | Meta/Index   |
+|  0    |  1    |  2    |  3    | (bloom       |
+| 64KB  | 64KB  | 64KB  | 64KB  |  filter)    |
++-------+-------+-------+-------+-------------+
+   ^       ^                          ^
+   |       |                          |
+   cached  cached                     cached
+   (memory)(disk)                     (memory)
+```
+
+🔸 Compaction-Aware Cache Refill
+
+LSM-Tree compaction 會產生新的 SSTable，舊的 SSTable 被刪除。
+如果不做處理，compaction 後 cache 全部失效，大量 miss 湧向 S3。
+
+RisingWave 的解法：
+1. Compaction 完成後，通知 compute node 更新 manifest
+2. 更新 manifest 之前，先把新 SSTable 的 block 批次寫入 disk cache
+3. 刻意寫入 disk cache 而不是 memory cache，避免汙染 hot data
+4. 批次讀取可以一次 S3 GET 拿到數十到數千個連續 block，降低成本
+
+```
+                Compaction 完成
+                     |
+                     v
+         +------------------------+
+         | Batch fetch new SST    |
+         | blocks from S3         |
+         | (one large GET request)|
+         +------------------------+
+                     |
+                     v
+         +------------------------+
+         | Write to Disk Cache    |  <-- 不進 memory cache
+         | (Foyer disk layer)     |      避免 evict hot data
+         +------------------------+
+                     |
+                     v
+         +------------------------+
+         | Update manifest        |  <-- 現在 read 可以找到新 block
+         | (switch to new SSTs)   |
+         +------------------------+
+```
+
+🔸 為什麼用 Foyer 不用 Moka
+
+Moka 是純 memory cache，容量受限於 RAM。
+串流 state 可以到 TB 等級，memory 不夠裝。
+Foyer 的 disk layer 讓 cache 容量擴大 10-1000 倍，
+大幅減少 S3 請求，同時保持 sub-100ms 延遲。
+
+🔸 跟 Sail #1015 的關係
+
+RisingWave 證明了 Foyer 在生產環境的可行性。
+它的使用模式（block-level cache、compaction-aware refill）
+比 Sail 需要的更複雜（Sail 只需 ObjectStore 層 cache）。
+
+關鍵學習：
+- Foyer 的 memory + disk 兩層設計是成熟的
+- disk cache 很重要：memory 不夠大時 disk 能接住大量 warm data
+- cache refill 概念可以用在 Sail：當 Delta/Iceberg compaction 產生新檔案時，
+  主動 prefetch 到 local cache
+
+
+## SlateDB：Foyer 在雲端 LSM 引擎的應用
+
+SlateDB 是雲端原生的嵌入式 key-value 引擎，
+把 LSM-Tree 的 SSTable 直接寫到 Object Storage（S3/GCS/ABS）。
+
+🔸 架構
+
+```
++-----------------------------------------+
+| SlateDB                                 |
+|                                         |
+|  +-----------+     +------------------+ |
+|  | MemTable  |     | db_cache module  | |
+|  | (writes)  |     | (reads)          | |
+|  +-----+-----+     +--------+---------+ |
+|        |                    |            |
+|        v                    v            |
+|  +------------------------------------------+
+|  | CachedObjectStore                        |
+|  | (wraps ObjectStore with local disk cache)|
+|  +------------------------------------------+
+|        |
+|        v
+|  +------------------------------------------+
+|  | ObjectStore (S3 / GCS / ABS / MinIO)     |
+|  +------------------------------------------+
++-----------------------------------------+
+```
+
+🔸 兩層 Cache
+
+SlateDB 有兩種獨立的 cache：
+
+```
++-----------------------+----------------------------------+------------------+
+| Cache                 | 快取什麼                         | 實作              |
++-----------------------+----------------------------------+------------------+
+| db_cache (in-memory)  | SST blocks, index, bloom filters | Foyer 或 Moka    |
+|                       | (解壓後的 in-memory 結構)        | (feature flag)   |
++-----------------------+----------------------------------+------------------+
+| CachedObjectStore     | raw bytes from object store      | 自己寫的          |
+| (local disk)          | (part-based, 未解壓)             | FsCacheStorage   |
++-----------------------+----------------------------------+------------------+
+```
+
+db_cache 是 in-memory cache，用 Foyer 或 Moka（預設 Foyer，64 MB）。
+CachedObjectStore 是 local disk cache，用自己的 FsCacheStorage。
+
+🔸 db_cache 的 Foyer 用法
+
+透過 `DbCache` trait 抽象，Foyer 和 Moka 是可插拔的：
+
+```rust
+// db_cache module
+pub trait DbCache {
+    fn get(&self, key: &CachedKey) -> Option<CachedEntry>;
+    fn insert(&self, key: CachedKey, entry: CachedEntry);
+}
+
+// CachedKey 可以定位到特定 SST 的特定 block
+pub struct CachedKey {
+    sst_id: SstId,
+    block_type: BlockType,  // Data / Index / BloomFilter
+    block_id: u64,
+}
+
+pub struct CachedEntry {
+    // 解壓後的 block 資料
+}
+```
+
+用 feature flag 切換：
+- `foyer` feature（預設開啟）→ 用 Foyer 的 Cache（memory-only，不用 HybridCache）
+- `moka` feature → 用 Moka
+
+🔸 CachedObjectStore 的設計
+
+這是 SlateDB 最值得 Sail 參考的部分。
+它直接實作了 `ObjectStore` trait，在上面包一層 local disk cache：
+
+```rust
+pub(crate) struct CachedObjectStore {
+    object_store: Arc<dyn ObjectStore>,
+    part_size_bytes: usize,          // 固定大小的 part（類似 Alluxio 的 page）
+    cache_storage: Arc<dyn LocalCacheStorage>,  // FsCacheStorage
+    admission_picker: AdmissionPicker,
+    cache_puts: bool,
+    stats: Arc<CachedObjectStoreStats>,
+}
+
+impl ObjectStore for CachedObjectStore {
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        self.cached_get_opts(location, options).await
+    }
+    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> Result<PutResult> {
+        self.cached_put_opts(location, payload, opts).await
+    }
+    // delete, list, copy, rename -> 直接 delegate，不 cache
+}
+```
+
+GET 的邏輯：
+1. 把請求的 byte range 切成固定大小的 part
+2. 每個 part 獨立查 cache
+3. cache miss 的 part 從 S3 讀取並回填
+4. 組合所有 part 回傳 stream
+
+```
+GET bytes 0-5MB from file.parquet
+       |
+       v
+Split into parts (part_size = 1MB):
+  Part 0: 0-1MB    -> cache HIT  (local disk)
+  Part 1: 1-2MB    -> cache HIT  (local disk)
+  Part 2: 2-3MB    -> cache MISS -> fetch from S3 -> save to disk
+  Part 3: 3-4MB    -> cache HIT  (local disk)
+  Part 4: 4-5MB    -> cache MISS -> fetch from S3 -> save to disk
+       |
+       v
+Combine all parts into result stream
+```
+
+PUT 的邏輯：
+- 先寫到 S3
+- 如果 `cache_puts` 開啟且 AdmissionPicker 允許，也寫到 local cache
+- 好處：剛寫入的 SST 馬上可以從 local cache 讀
+
+🔸 跟 Sail #1015 的關係
+
+SlateDB 的 CachedObjectStore 就是 Sail #1015 要做的事。
+差別是 SlateDB 用自己寫的 FsCacheStorage，Sail 打算用 Foyer。
+
+可以直接參考的設計：
+- part-based 切分（固定大小 part，類似 Alluxio 的 page）
+- AdmissionPicker（控制哪些資料要寫入 cache）
+- cache_puts（PUT 操作也回填 cache）
+- 分離 in-memory cache（db_cache / Foyer）和 disk cache（CachedObjectStore）
+
+
+## 總結對比
+
+```
++-------------------+---------------+-----------+--------------------+-----------+
+| 系統              | 快取層級      | 快取粒度  | 快取引擎           | 格式感知  |
++-------------------+---------------+-----------+--------------------+-----------+
+| Trino + Alluxio   | ObjectStore   | 1 MB page | Alluxio (Java)     | 否        |
+|                   | (byte range)  |           | LRU + TTL          |           |
++-------------------+---------------+-----------+--------------------+-----------+
+| RisingWave        | Storage Engine| SST block | Foyer (Rust)       | 是        |
+|                   | (LSM block)   | ~64 KB    | memory + disk      | (SST      |
+|                   |               |           | LRU/LFU/S3-FIFO   |  block)   |
++-------------------+---------------+-----------+--------------------+-----------+
+| SlateDB           | ObjectStore   | fixed     | Foyer (memory)     | 否        |
+|                   | + in-memory   | part size | + FsCacheStorage   | (object   |
+|                   |               |           | (disk)             |  store)   |
++-------------------+---------------+-----------+--------------------+-----------+
+| LiquidCache       | Separate      | RecordBat | 自研 transcoded    | 是        |
+|                   | cache server  | ch/column | format             | (pushdown |
+|                   |               |           | memory + SSD       |  aware)   |
++-------------------+---------------+-----------+--------------------+-----------+
+| Sail #1015 (建議) | ObjectStore   | fixed     | Foyer (Rust)       | 否        |
+|                   | (byte range)  | part size | memory + disk      | (format   |
+|                   |               | ~1 MB     | LRU                |  agnostic)|
++-------------------+---------------+-----------+--------------------+-----------+
+```
+
+Sail #1015 的建議設計最接近 SlateDB 的 CachedObjectStore + Trino/Alluxio 的 page-based 模式：
+- ObjectStore trait 層包裝，format-agnostic
+- 固定大小 part/page（建議 1 MB）
+- Foyer HybridCache（memory + disk）取代 SlateDB 自寫的 FsCacheStorage
+- AdmissionPicker 控制寫入策略
+- TTL 或 ETag 做 invalidation
