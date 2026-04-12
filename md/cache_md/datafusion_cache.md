@@ -762,7 +762,7 @@ is_valid_for() 會自動偵測到檔案被改過。
    → is_valid_for() 比對失敗
    → metadata cache 過期 → 重讀新的 footer
 
-所以發現過期的最大延遲 = listing cache 的 TTL（Sail 預設 60 秒）
+所以發現過期的最大延遲 = listing cache 的 TTL（Sail 預設 1800 秒 = 30 分鐘，且預設關閉）
 ```
 
 🔸 Data Lake 場景為什麼更安全
