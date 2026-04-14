@@ -495,8 +495,394 @@ message EndOfData {}
 ```
 
 Marker 跟著資料一起在 pipeline 裡流動，不包含實際資料。
-目前只有 EndOfData 被實際使用（在 StreamSourceAdapterExec 和 StreamLimitExec）。
-Watermark、Checkpoint、LatencyTracker 是為未來 streaming aggregate 和 fault tolerance 預留的。
+
+🔸 目前哪些 source / node 實際有發哪些 marker
+
+搜遍整個 codebase，只有 EndOfData 被實際發送。
+LatencyTracker、Watermark、Checkpoint 只存在於 marker.rs 的單元測試（encode/decode round-trip），
+沒有任何 source 或 node 在執行時發送。
+
+```
++---------------------+------------------+---------------------------------------------+
+| 元件                | 發的 marker      | 源碼位置                                    |
++---------------------+------------------+---------------------------------------------+
+| StreamSource        | 無               | RateSourceExec 和 SocketSourceExec 只發     |
+| AdapterExec         | EndOfData        | FlowEvent::append_only_data（資料），       |
+|                     |                  | 不發任何 marker。                           |
+|                     |                  | EndOfData 是 StreamSourceAdapterExec 在     |
+|                     |                  | batch source 讀完後用 .chain() 追加的：     |
+|                     |                  | source_adapter.rs:89-91                     |
++---------------------+------------------+---------------------------------------------+
+| RateSourceExec      | 無               | 只用 unfold + sleep 產生                    |
+|                     |                  | FlowEvent::append_only_data，              |
+|                     |                  | 無限 stream，不發任何 marker。              |
+|                     |                  | rate/reader.rs:237                          |
++---------------------+------------------+---------------------------------------------+
+| SocketSourceExec    | 無               | 跟 rate 一樣，只發 append_only_data。       |
++---------------------+------------------+---------------------------------------------+
+| StreamLimitExec     | EndOfData        | 讀夠行數後手動發 EndOfData 終止 stream。    |
+|                     |                  | limit.rs:228 透傳上游的 marker。            |
++---------------------+------------------+---------------------------------------------+
+| StreamFilterExec    | 透傳             | 不產生 marker，上游有什麼 marker 就透傳。   |
++---------------------+------------------+---------------------------------------------+
+| StreamCollectorExec | 不產生，只消費   | 收到 Marker → 丟掉（filter_map None）。     |
+|                     |                  | 收到 Data → 輸出 batch。                    |
+|                     |                  | collector.rs:113                            |
++---------------------+------------------+---------------------------------------------+
+| ConsoleSinkExec     | 不區分           | 直接把 encoded RecordBatch 印出來，         |
+|                     |                  | 不解碼 FlowEvent，marker 行也會被印。       |
++---------------------+------------------+---------------------------------------------+
+| Watermark           | 沒人發           | 只在 marker.rs 測試裡出現。                 |
+|                     |                  | 未來 source（如 Kafka）需要根據 event time  |
+|                     |                  | 定期發 Watermark，才能支援 streaming        |
+|                     |                  | aggregate 和 stream-stream join。           |
++---------------------+------------------+---------------------------------------------+
+| Checkpoint          | 沒人發           | 只在 marker.rs 測試裡出現。                 |
+|                     |                  | 未來需要 checkpoint coordinator 定期        |
+|                     |                  | 注入 Checkpoint marker 到所有 source。      |
++---------------------+------------------+---------------------------------------------+
+| LatencyTracker      | 沒人發           | 只在 marker.rs 測試裡出現。                 |
+|                     |                  | 未來可以由監控系統定期注入，                |
+|                     |                  | 用來量測端到端延遲。                        |
++---------------------+------------------+---------------------------------------------+
+```
+
+總結：目前 Sail 的 streaming 只用到 EndOfData，整個 marker 體系的其餘三種都是預留設計。
+要支援 streaming aggregate / join / fault tolerance，第一步就是讓 source 開始發 Watermark。
+
+🔸 Watermark — 建議實作與原理
+
+原理：Watermark 告訴下游「event time 早於這個時間戳的資料，不會再來了」。
+有了 Watermark，下游的 aggregate / join 才知道什麼時候可以結算一個時間窗口、清掉過期 state。
+
+Spark 的使用方式：
+
+```python
+df = spark.readStream.format("kafka").load() \
+    .withWatermark("event_time", "10 minutes")
+#                   ↑ 哪個欄位        ↑ 允許多晚到達（late threshold）
+```
+
+意思是：如果目前看到的最大 event_time 是 10:30，
+那 Watermark = 10:30 - 10min = 10:20，
+表示 10:20 之前的資料不會再來了（晚超過 10 分鐘的就丟棄）。
+
+建議在 Sail 裡的實作方式：
+
+```
+1. 在 RateSourceExec / KafkaSourceExec 的 execute() 裡追蹤 max_event_time
+2. 每隔 N 個 batch（或每隔 N 秒）發一個 Watermark marker
+
+改動 rate/reader.rs 的 execute()：
+
+目前（只發資料）：
+  unfold(generator, |gen| {
+      sleep(interval);
+      let batch = gen.generate(batch_size);
+      Some((Ok(FlowEvent::append_only_data(batch)), gen))
+  })
+
+改成（資料 + 定期 watermark）：
+  unfold((generator, batch_count), |(gen, count)| {
+      sleep(interval);
+      let batch = gen.generate(batch_size);
+
+      if count % WATERMARK_INTERVAL == 0 {
+          // 每 100 個 batch 發一次 watermark
+          let wm_time = current_max_event_time - late_threshold;
+          Some((vec![
+              Ok(FlowEvent::append_only_data(batch)),
+              Ok(FlowEvent::Marker(FlowMarker::Watermark {
+                  source: "rate".into(),
+                  timestamp: wm_time,
+              })),
+          ], (gen, count + 1)))
+      } else {
+          Some((vec![Ok(FlowEvent::append_only_data(batch))], (gen, count + 1)))
+      }
+  }).flat_map(|events| stream::iter(events))
+```
+
+下游 node 的處理：
+
+```
+StreamFilterExec   → 收到 Watermark → 直接透傳（目前已經會透傳所有 marker）
+StreamLimitExec    → 收到 Watermark → 直接透傳（目前已經會透傳）
+StreamAggregateExec（未來）→ 收到 Watermark → 結算已到期的 window → 輸出結果 → 清 state
+StreamStreamJoinExec（未來）→ 收到 Watermark → evict 過期 buffer entry
+```
+
+Watermark 在 join 裡的傳播：
+
+```
+左 source → Watermark(10:20)
+右 source → Watermark(10:25)
+
+JoinExec 內部：
+  left_wm = 10:20
+  right_wm = 10:25
+  output_wm = min(10:20, 10:25) = 10:20  ← 往下游發這個
+  // 用 min 是因為：左邊還可能來 10:20-10:25 的資料
+  // 只有兩邊都過了 10:20，才能保證 10:20 之前的不會再來
+```
+
+🔸 Checkpoint — 建議實作與原理
+
+原理：Checkpoint 告訴所有 stateful node「把你目前的 state 存下來」。
+如果 query 掛了，可以從最近一次 checkpoint 的 state 恢復，不需要從頭重跑。
+
+需要 checkpoint 的場景：streaming aggregate 和 stream-stream join 都有 state（如 group 的 partial sum、join 的 buffer），這些 state 只存在記憶體裡。
+如果 process 掛了，state 就沒了，重啟後要從 Kafka offset 0 開始重跑所有資料。
+
+建議實作方式：
+
+```
+架構：
+  CheckpointCoordinator（新元件，在 StreamingQuery 層）
+    │
+    │ 每隔 N 秒 / 每 N 個 batch
+    │
+    ├→ 注入 Checkpoint(id=1) 到所有 source
+    │    source_1 → [data, data, Checkpoint(1), data, data, ...]
+    │    source_2 → [data, Checkpoint(1), data, data, ...]
+    │
+    ├→ 等所有 sink 收到 Checkpoint(1)
+    │    sink 收到 Checkpoint(1) 代表：
+    │    「Checkpoint(1) 之前的所有資料都已經被處理完了」
+    │
+    └→ 通知所有 stateful node 把 state 快照到 disk
+         AggregateExec → 存 group state
+         JoinExec → 存 left_buffer + right_buffer
+         Source → 存 Kafka offset
+
+恢復流程：
+  1. 讀取最近的 checkpoint（如 id=5）
+  2. 每個 source 從 checkpoint 記錄的 offset 開始讀
+  3. 每個 stateful node 從 checkpoint 恢復 state
+  4. 繼續處理新資料
+```
+
+為什麼要用 marker 注入（而不是直接通知 node）：
+
+```
+問題：兩個 source 的速度不同
+
+source_1: [d, d, d, d, d, d, d, d]     ← 快
+source_2: [d, d]                        ← 慢
+
+如果在 t=5 時直接通知 JoinExec「存 state」：
+  left_buffer 已經收了 source_1 的 8 筆資料
+  right_buffer 只收了 source_2 的 2 筆資料
+  → 這個 state 快照不一致！
+
+用 marker 注入的做法：
+  source_1: [d, d, d, Checkpoint(1), d, d, d, d]
+  source_2: [d, Checkpoint(1), d]
+
+  JoinExec 收到左邊的 Checkpoint(1)：先記住，不動作
+  JoinExec 收到右邊的 Checkpoint(1)：兩邊都到了 → 現在存 state
+  → 這個時間點，兩邊 buffer 裡的資料都是 Checkpoint(1) 之前的 → 一致！
+```
+
+這就是 Flink 的 Chandy-Lamport 分散式快照演算法的核心思想：
+用 barrier（marker）在 stream 裡切出一致的快照邊界。
+
+那 Checkpoint marker 實際上怎麼「塞進 source 的 stream 裡」？
+source 的 stream 是 `futures::stream::unfold` 產生的無限迴圈，
+Checkpoint 不是 source 自己決定要發的，是外部的 CheckpointCoordinator 決定的。
+
+做法：用 mpsc channel 從外部注入。
+
+```rust
+// Source 啟動時建立一個 channel
+let (marker_tx, marker_rx) = mpsc::channel::<FlowMarker>(16);
+
+// Source 的 stream：用 tokio::select! 同時聽「產生資料」和「外部注入 marker」
+let output = futures::stream::unfold(
+    (generator, marker_rx),
+    |(mut gen, mut rx)| async move {
+        tokio::select! {
+            // 正常產生資料（等 interval 到）
+            _ = tokio::time::sleep(interval) => {
+                let batch = gen.generate(batch_size);
+                Some((Ok(FlowEvent::append_only_data(batch)), (gen, rx)))
+            }
+            // 外部注入 marker（CheckpointCoordinator 發來的）
+            Some(marker) = rx.recv() => {
+                Some((Ok(FlowEvent::Marker(marker)), (gen, rx)))
+            }
+        }
+    },
+);
+```
+
+CheckpointCoordinator 持有每個 source 的 marker_tx：
+
+```
+CheckpointCoordinator（住在 StreamingQuery 層）
+  │
+  │  持有 marker_tx_1, marker_tx_2, ...（每個 source 一個）
+  │
+  │  每隔 N 秒觸發一次 checkpoint：
+  ├→ marker_tx_1.send(Checkpoint(1))  → source_1 的 rx 收到 → 插入 stream
+  ├→ marker_tx_2.send(Checkpoint(1))  → source_2 的 rx 收到 → 插入 stream
+  │
+  │  marker 跟著資料流動...
+  │
+  └→ 等 sink 回報 Checkpoint(1) 完成 → 記錄「checkpoint 1 已完成」
+```
+
+為什麼用 channel + select 而不是輪詢 flag：
+
+```
+方法 1（不好）：輪詢 flag
+  loop {
+      if should_checkpoint { emit marker }  // 誰設 flag？race condition？
+      sleep(interval);
+      emit data;
+  }
+
+方法 2（好）：channel + select
+  tokio::select! {
+      _ = sleep(interval) => emit data     // 正常節奏
+      Some(m) = rx.recv() => emit marker   // 外部注入，立即響應
+  }
+  // channel 天然 thread-safe，select 天然異步，不需要鎖
+```
+
+channel 的好處是 source 完全不需要知道 checkpoint 的邏輯，
+它只負責「收到什麼就發什麼」。所有排程決策（多久一次、哪些 source 要注入）
+都在 CheckpointCoordinator 裡，source 保持簡單。
+Flink 也是這個做法 — CheckpointCoordinator 透過 StreamTask 的 input channel 注入 CheckpointBarrier。
+
+🔸 LatencyTracker — 建議實作與原理
+
+原理：在 source 端注入一個帶時間戳的 marker，
+當 sink 收到它時，用「收到時間 - 注入時間」算出端到端延遲。
+用於監控 streaming pipeline 是否健康、有沒有 backpressure 導致延遲飆高。
+
+```
+使用情境：
+  DevOps 想知道「從資料進入 pipeline 到被 sink 處理完，要多久？」
+
+  如果延遲突然從 200ms 跳到 5s → 某個 node 有瓶頸（backpressure）
+  如果延遲穩定在 50ms → pipeline 健康
+```
+
+建議實作方式：
+
+```
+1. Source 端（注入）：
+
+  每隔 N 秒注入一個 LatencyTracker：
+  FlowEvent::Marker(FlowMarker::LatencyTracker {
+      source: "rate-0".into(),     // source 名稱 + partition
+      id: tracker_id,              // 遞增 ID
+      timestamp: Utc::now(),       // 注入時的時間
+  })
+
+  tracker 跟著資料一起流過整個 pipeline：
+  source → filter → projection → join → aggregate → sink
+
+2. 中間 node（透傳）：
+
+  StreamFilterExec、StreamLimitExec 等 → 收到 LatencyTracker → 直接透傳
+  （目前的實作已經會透傳所有 marker，不需要改）
+
+3. Sink 端（量測）：
+
+  ConsoleSinkExec / FileSinkExec 收到 LatencyTracker 時：
+  let latency = Utc::now() - tracker.timestamp;
+  metrics.record("e2e_latency", latency);
+  // 不輸出到結果，只記錄到 metrics
+
+4. 監控面板：
+
+  Grafana 之類的工具讀取 metrics，畫出：
+  - P50 / P99 延遲
+  - 每個 source 的延遲（用 source 欄位區分）
+  - 延遲趨勢（用 id 欄位排序）
+```
+
+跟其他 marker 的差別：
+
+```
++------------------+----------+----------+---------+
+| Marker           | 誰注入   | 誰消費   | 頻率    |
++------------------+----------+----------+---------+
+| Watermark        | Source   | 中間 node| 每 N batch |
+|                  |          | (agg/join)|         |
++------------------+----------+----------+---------+
+| Checkpoint       | Coordinator| 所有 stateful node | 每 N 秒 |
++------------------+----------+----------+---------+
+| LatencyTracker   | Source   | Sink     | 每 N 秒 |
++------------------+----------+----------+---------+
+| EndOfData        | Source/  | Collector| 一次    |
+|                  | Limit    |          |         |
++------------------+----------+----------+---------+
+```
+
+LatencyTracker 是四種 marker 裡最容易實作的：不需要任何 state、不影響資料正確性、只需要 source 注入 + sink 量測。適合作為 marker 體系的第一個進階實作練手。
+
+🔸 分散式場景：Marker 必須 broadcast
+
+Marker 被編碼成普通 RecordBatch 的一行（`_marker` 欄位非 null），
+所以它會跟著資料一起在 shuffle/exchange 裡流動。
+但如果 exchange 用 hash repartition，marker 只會送到一個 partition：
+
+```
+source(partition=0): [data, data, Checkpoint(1), data, ...]
+                                       │
+                          HashRepartition(by user_id)
+                          ┌──────┬──────┬──────┐
+                          ↓      ↓      ↓      ↓
+                       part_0  part_1  part_2  part_3
+
+Checkpoint(1) 這行的 user_id 是 placeholder（0），
+hash(0) 可能 = 2 → 只有 part_2 收到
+part_0、part_1、part_3 永遠收不到 → checkpoint 永遠完不成
+```
+
+不只 Checkpoint，所有 marker 都有這個問題：
+
+```
++------------------+-----------------------------------------------------------+
+| Marker           | 如果只有一個 partition 收到會怎樣                         |
++------------------+-----------------------------------------------------------+
+| Checkpoint       | 其他 partition 的 stateful node 永遠等不到               |
+|                  | → checkpoint 永遠完不成                                  |
++------------------+-----------------------------------------------------------+
+| Watermark        | 其他 partition 的 join/aggregate 不知道可以 evict state  |
+|                  | → state 無限增長 → OOM                                   |
++------------------+-----------------------------------------------------------+
+| EndOfData        | 其他 partition 不知道 stream 結束了                       |
+|                  | → StreamCollectorExec 永遠等不到所有 partition 結束      |
++------------------+-----------------------------------------------------------+
+| LatencyTracker   | 只量到一個 partition 的延遲，其他未知                     |
+|                  | → 不影響正確性，但監控資料不完整                         |
++------------------+-----------------------------------------------------------+
+```
+
+所以 exchange/shuffle 層需要對 marker 做特殊處理 — broadcast 到所有下游 partition：
+
+```
+source(partition=0): [data, data, Checkpoint(1), data, ...]
+                                       │
+                          ┌─── _marker IS NOT NULL？───┐
+                          │ YES                        │ NO
+                          ↓                            ↓
+                     Broadcast 到                HashRepartition
+                     所有 partition              按 user_id 分
+                    ┌────┬────┬────┐
+                    ↓    ↓    ↓    ↓
+                 part_0 part_1 part_2 part_3  ← 每個都收到 Checkpoint(1)
+```
+
+Flink 也是這個做法：CheckpointBarrier 走 broadcast channel，不走 hash partition。
+
+目前 Sail 還沒碰到這個問題，因為只有 EndOfData 被使用，
+而且目前沒有跨 worker 的 streaming shuffle。
+但未來做 distributed streaming 時，這是 exchange 層必須處理的。
 
 
 ## 第 7 步：Flow Event Schema — 把 FlowEvent 編碼成 RecordBatch
@@ -957,6 +1343,341 @@ StreamCollectorExec                 ← 收集 flow event 成 batch
 | Trigger 語義       | 忽略        |
 | Output Mode        | 忽略        |
 +--------------------+-------------+
+```
+
+
+## 未來：Streaming Join 設計思路
+
+目前 rewriter 裡 Join 會回傳 `not_impl_err`（未來要做），Sort 回傳 `plan_err`（本質不支援）。
+以下是 streaming join 的設計思路。
+
+🔸 Phase 1：Stream-Batch Join（先做，簡單）
+
+一邊是 streaming source，另一邊是靜態 batch table（如 Parquet 維度表）。
+
+```
+場景：streaming 訂單 JOIN 靜態商品表
+
+  orders (streaming)              products (batch)
+  +-----------+------------+      +------------+-------+
+  | order_id  | product_id |      | product_id | name  |
+  +-----------+------------+      +------------+-------+
+  | 1         | A          |      | A          | 蘋果  |
+  | 2         | B          |      | B          | 香蕉  |
+
+  SELECT o.order_id, p.name
+  FROM orders o JOIN products p ON o.product_id = p.product_id
+```
+
+做法：batch 側啟動時全部讀進 hash table（build side），streaming 側每來一個 batch 就去 probe。
+
+```
+  streaming side (probe)          batch side (build)
+  ┌──────────────────┐            ┌──────────────────┐
+  │ RateSourceExec   │            │ ParquetExec      │
+  │ (Unbounded)      │            │ (Bounded)        │
+  └────────┬─────────┘            └────────┬─────────┘
+           │                               │
+           │    ┌─────────────────────┐    │
+           └───→│ StreamHashJoinExec  │←───┘
+                │ build: batch side   │
+                │ probe: stream side  │
+                └─────────┬───────────┘
+                          │
+                   flow event output
+```
+
+不需要 Watermark 和 State Store，因為 batch 側是靜態的、有限的。
+streaming 側的 marker 直接透傳，batch 側沒有 marker。
+
+🔸 Phase 2：Stream-Stream Join（後做，複雜）
+
+兩邊都是 streaming source，核心是 StreamStreamJoinExec。
+
+```
+場景：streaming 點擊事件 JOIN streaming 曝光事件
+
+  SELECT c.user_id, i.ad_id
+  FROM clicks c JOIN impressions i
+    ON c.user_id = i.user_id
+    AND c.time BETWEEN i.time AND i.time + INTERVAL 10 MINUTES
+```
+
+🔸 StreamStreamJoinExec 結構
+
+```rust
+// 假想的設計
+pub struct StreamStreamJoinExec {
+    left: Arc<dyn ExecutionPlan>,       // 左邊 streaming source
+    right: Arc<dyn ExecutionPlan>,      // 右邊 streaming source
+    on: Vec<(Column, Column)>,          // JOIN key（如 user_id = user_id）
+    join_type: JoinType,                // Inner / Left / Right / Full
+    time_condition: Option<TimeRange>,  // 時間窗口（如 BETWEEN i.time AND i.time + 10min）
+    properties: Arc<PlanProperties>,
+}
+```
+
+🔸 execute() — 同時消費兩邊 stream
+
+兩邊是獨立的 stream，用 tokio::select! 交替處理哪邊先來就處理哪邊：
+
+```rust
+fn execute(&self, partition: usize, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+    let left_stream = DecodedFlowEventStream::try_new(
+        self.left.execute(partition, context.clone())?
+    )?;
+    let right_stream = DecodedFlowEventStream::try_new(
+        self.right.execute(partition, context)?
+    )?;
+
+    let state = JoinState::new(self.on.clone(), self.time_condition.clone());
+
+    let output = futures::stream::unfold(
+        (left_stream, right_stream, state),
+        |(mut left, mut right, mut state)| async move {
+            tokio::select! {
+                Some(event) = left.next() => {
+                    let output = state.process_left(event?);
+                    Some((output, (left, right, state)))
+                }
+                Some(event) = right.next() => {
+                    let output = state.process_right(event?);
+                    Some((output, (left, right, state)))
+                }
+                else => None  // 兩邊都結束
+            }
+        },
+    );
+
+    let stream = output.flat_map(|events| futures::stream::iter(events.into_iter().map(Ok)));
+    let stream = Box::pin(FlowEventStreamAdapter::new(self.output_schema(), stream));
+    Ok(Box::pin(EncodedFlowEventStream::new(stream)))
+}
+```
+
+🔸 JoinState — 雙邊 buffer + watermark evict
+
+```rust
+struct JoinState {
+    left_buffer: HashMap<JoinKey, Vec<BufferedRow>>,
+    right_buffer: HashMap<JoinKey, Vec<BufferedRow>>,
+    left_watermark: Option<SystemTime>,
+    right_watermark: Option<SystemTime>,
+    on: Vec<(Column, Column)>,
+    time_condition: Option<TimeRange>,
+}
+
+struct BufferedRow {
+    batch: RecordBatch,     // 這行的資料
+    event_time: SystemTime, // event time（用來判斷過期）
+}
+```
+
+三個核心方法：
+
+```rust
+impl JoinState {
+    /// 左邊來了一個 event
+    fn process_left(&mut self, event: FlowEvent) -> Vec<FlowEvent> {
+        match event {
+            FlowEvent::Data { batch, retracted } => {
+                let mut output = vec![];
+                for row in batch.iter_rows() {
+                    let key = extract_join_key(&row, &self.on);
+                    // 1. 去右邊 buffer 找配對
+                    if let Some(matches) = self.right_buffer.get(&key) {
+                        for matched in matches {
+                            if self.time_in_range(&row, matched) {
+                                output.push(combine_rows(&row, matched));
+                            }
+                        }
+                    }
+                    // 2. 存進左邊 buffer（等右邊未來的資料來配對）
+                    self.left_buffer.entry(key).or_default()
+                        .push(BufferedRow::from(row));
+                }
+                vec![FlowEvent::append_only_data(output)]
+            }
+            FlowEvent::Marker(FlowMarker::Watermark { timestamp, .. }) => {
+                self.left_watermark = Some(timestamp);
+                self.try_evict();
+                self.emit_watermark()
+            }
+            FlowEvent::Marker(other) => vec![FlowEvent::Marker(other)],
+        }
+    }
+
+    /// 右邊來了一個 event（跟 process_left 對稱）
+    fn process_right(&mut self, event: FlowEvent) -> Vec<FlowEvent> {
+        // 左右互換的相同邏輯
+    }
+
+    /// 用 watermark 清掉過期的 buffer
+    fn try_evict(&mut self) {
+        // safe_wm = min(左 watermark, 右 watermark)
+        // 因為兩邊都過了這個時間，才能確定不會再有更早的資料
+        let safe_wm = match (self.left_watermark, self.right_watermark) {
+            (Some(l), Some(r)) => Some(l.min(r)),
+            _ => None,
+        };
+        if let Some(wm) = safe_wm {
+            self.left_buffer.retain(|_, rows| {
+                rows.retain(|row| row.event_time >= wm - self.time_range());
+                !rows.is_empty()
+            });
+            self.right_buffer.retain(|_, rows| {
+                rows.retain(|row| row.event_time >= wm - self.time_range());
+                !rows.is_empty()
+            });
+        }
+    }
+}
+```
+
+🔸 實際上資料是一批 batch 流進來，不是一行一行
+
+上面 `for row in batch.iter_rows()` 是概念性的寫法。
+實際上 DataFusion 是 columnar 的，FlowEvent::Data 的 batch 可能有幾百行。
+真正的實作會用 columnar 操作：
+
+```
+實際的資料流（rate source, rows_per_second=1000, batches_per_second=10）：
+
+每 100ms 產生一個 batch，每個 batch 有 100 行：
+
+t=0ms    FlowEvent::Data { batch: RecordBatch(100 rows), retracted: [false; 100] }
+t=100ms  FlowEvent::Data { batch: RecordBatch(100 rows), retracted: [false; 100] }
+t=200ms  FlowEvent::Data { batch: RecordBatch(100 rows), retracted: [false; 100] }
+...
+
+偶爾穿插 marker：
+t=5000ms FlowEvent::Marker(Watermark { time=t-5s })
+```
+
+StreamStreamJoinExec 收到的是整個 RecordBatch（100 行），不是一行一行。
+所以 process_left 的真正實作會是 batch 級別的操作：
+
+```rust
+fn process_left_batch(&mut self, batch: RecordBatch) -> Vec<RecordBatch> {
+    // 1. 從 batch 裡抽出 join key column
+    let keys = batch.column(self.left_key_index);
+
+    // 2. 對整個 batch 做 hash probe（不是逐行）
+    //    類似 DataFusion HashJoinExec 的 probe 邏輯
+    let (matched_left_indices, matched_right_indices) =
+        self.probe_right_buffer(keys);
+
+    // 3. 用 indices 做 take 操作，拼出配對結果
+    let left_matched = take_batch(&batch, &matched_left_indices);
+    let right_matched = take_buffered(&self.right_buffer, &matched_right_indices);
+    let output = concat_columns(left_matched, right_matched);
+
+    // 4. 把整個 batch 存進左邊 buffer
+    //    按 join key group 存，方便右邊來的時候 probe
+    self.insert_to_left_buffer(batch);
+
+    vec![output]
+}
+```
+
+用時間線走一遍具體的 batch 流動：
+
+```
+左邊(clicks)                 StreamStreamJoinExec                 右邊(impressions)
+                             left_buf    right_buf
+                             (empty)     (empty)
+
+t=0   ─── batch_R1 ─────────────────────────────────── batch_R1 來了
+      100 rows               left_buf    right_buf     (user=A..Z, time=10:00-10:01)
+      (impressions)          (empty)     {A:[..],      → 沒左邊配對 → 存進 right_buf
+                                          B:[..],      → 輸出：空
+                                          ...}
+
+t=100ms                                                batch_L1 來了
+      batch_L1 ─────────────────────────────────────   (user=A,B,C, time=10:00)
+      50 rows                left_buf    right_buf     → probe right_buf
+      (clicks)               {A:[..],   {A:[..],      → user=A 配對到！time 在範圍內
+                              B:[..],    B:[..],       → user=B 配對到！
+                              C:[..]}    ...}          → 輸出：matched_batch(30 rows)
+                                                       → 同時存進 left_buf
+
+t=200ms                                                batch_L2 來了
+      batch_L2 ─────────────────────────────────────   (user=D,E, time=10:01)
+      50 rows                left_buf    right_buf     → probe right_buf
+      (clicks)               {A,B,C,    {A,B,...}      → user=D 配對到！
+                              D,E}                     → 輸出：matched_batch(20 rows)
+
+t=5000ms                                               Watermark 來了
+      Watermark(10:05) ─────────────────────────────   右邊的 watermark
+                             right_wm = 10:05
+                             left_wm = None
+                             → 只有一邊有 wm，不能 evict
+
+t=5100ms
+      ── Watermark(10:03) ──────────────────────────   左邊的 watermark
+                             right_wm = 10:05
+                             left_wm = 10:03
+                             safe_wm = min(10:03, 10:05) = 10:03
+                             → 清掉 time < 10:03 - 10min = 9:53 的 entry
+                             → 這次沒啥好清的（資料都在 10:00 之後）
+                             → 往下游發 Watermark(10:03)
+
+t=很久以後
+      ── Watermark(10:30) ──────────────────────────
+                             safe_wm = min(10:30, 10:25) = 10:25
+                             → 清掉 time < 10:25 - 10min = 10:15 的 entry
+                             → left_buf 和 right_buf 裡 10:15 之前的全清掉
+                             → buffer 不會無限增長
+```
+
+🔸 為什麼是 batch 級別而不是逐行
+
+```
++----------------+-----------------------+------------------------------+
+| 處理方式       | 逐行                  | 逐 batch（columnar）         |
++----------------+-----------------------+------------------------------+
+| 100 行的處理   | for row in 0..100     | 一次 hash probe 100 個 key   |
+|                | hash_lookup(row.key)  | take(batch, matched_indices) |
+|                | combine(row, match)   | concat_columns(left, right)  |
++----------------+-----------------------+------------------------------+
+| CPU 效率       | 差（逐元素、cache miss）| 好（向量化、SIMD friendly）  |
++----------------+-----------------------+------------------------------+
+| Arrow 相容性   | 需要拆 Array → 逐元素 | 直接操作 Array（零拷貝 slice）|
++----------------+-----------------------+------------------------------+
+```
+
+DataFusion 的 HashJoinExec 也是 batch 級別的 probe，
+StreamStreamJoinExec 可以直接複用 DataFusion 的 hash table 和 take/concat 工具函數。
+
+🔸 需要的基礎設施
+
+```
++-------------------+------------------------------------------+----------+
+| 元件              | 用途                                     | 現狀     |
++-------------------+------------------------------------------+----------+
+| Watermark 產生    | source 定期發 Watermark marker           | 未實作   |
++-------------------+------------------------------------------+----------+
+| Watermark 傳播    | join node 取 min(左, 右) 往下游傳        | 未實作   |
++-------------------+------------------------------------------+----------+
+| State Store       | 存 join buffer                           | 未實作   |
+|                   | 小資料 in-memory HashMap                 |          |
+|                   | 大資料 RocksDB / Foyer 溢出到 disk       |          |
++-------------------+------------------------------------------+----------+
+| Checkpoint        | 定期把 state store 快照存下來            | 未實作   |
++-------------------+------------------------------------------+----------+
+| 時間條件解析      | 從 JOIN ON 裡抽出 time range 條件        | 未實作   |
++-------------------+------------------------------------------+----------+
+```
+
+🔸 建議實作順序
+
+```
+1. Stream-Batch Join          ← 不需要 Watermark / State Store，實用性最高
+2. Watermark 產生 + 傳播      ← Phase 2 和 Aggregate 的共同前置
+3. State Store (in-memory)    ← 先做記憶體版本
+4. Streaming Aggregate        ← 比 stream-stream join 簡單（只需單邊 state）
+5. Stream-Stream Join         ← 最複雜，需要上面全部
+6. Checkpoint + Recovery      ← production 才需要
 ```
 
 
